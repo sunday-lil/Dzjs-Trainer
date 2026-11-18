@@ -102,3 +102,17 @@ mtest.txt
 # Local working notes (docs/ is tracked, docs/analysis/ is not)
 # ---------------------------------------------------------------------------
 /docs/analysis/
+# Local diagnostics, generated release staging, and agent workspace state
+/.workbuddy-ai/
+/artifacts/
+/dump-*/
+/dump-analysis*.txt
+/obj-*/
+/symbols/
+/test-media/
+/Release-v*/
+/mtest.txt
+/.workbuddy/
+
+# Portable bundles produced by tools/Build-PortableBundle.ps1
+/dist/
