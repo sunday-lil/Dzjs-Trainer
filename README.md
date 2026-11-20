@@ -1,5 +1,8 @@
 # Dzjs Trainer
 
+[![ci](https://github.com/sunday-lil/Dzjs-Trainer/actions/workflows/ci.yml/badge.svg)](https://github.com/sunday-lil/Dzjs-Trainer/actions/workflows/ci.yml)
+
+
 当前版本：`v1.0.5.2`
 
 > 本仓库是**社区修复版**（fork）。与上游的差异、构建方式与已知限制见 [docs/EDITION.md](docs/EDITION.md)。
