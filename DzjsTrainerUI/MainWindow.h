@@ -159,6 +159,22 @@ private:
 	HWND teacherShutdownButton = nullptr;
 	HWND teacherRebootButton = nullptr;
 	HWND teacherStudentList = nullptr;
+	// 教师端内置控制台：公开的 Python 版是命令行程序，没有可嵌入的 GUI，
+	// 这里把它的 stdin/stdout 接管，用编辑框做交互。
+	HANDLE teacherStdin = nullptr;
+	HANDLE teacherStdout = nullptr;
+	HANDLE teacherReader = nullptr;
+	HWND teacherConsoleLog = nullptr;
+	HWND teacherConsoleInput = nullptr;
+	HWND teacherConsoleSend = nullptr;
+	bool teacherConsoleMode = false;
+	void EnsureTeacherConsole();
+	void LayoutTeacherConsole();
+	void AppendTeacherConsole(const std::wstring& text);
+	void SendTeacherConsoleCommand();
+	void CloseTeacherConsole();
+	// 以进程内控制台的方式启动教师端（接管 stdin/stdout）。
+	bool StartTeacherConsoleProcess(const std::wstring& executable, const std::wstring& workingDirectory);
 	std::unique_ptr<TeacherBackend> teacherBackend;
 	std::vector<std::string> teacherDisplayedIps;
 	HANDLE avScanThread = nullptr;

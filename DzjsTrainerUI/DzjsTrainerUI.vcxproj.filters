@@ -47,6 +47,9 @@
     <ClCompile Include="MainWindow.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="TeacherConsole.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
     <ClCompile Include="BugReportWindow.cpp">
       <Filter>源文件</Filter>
     </ClCompile>

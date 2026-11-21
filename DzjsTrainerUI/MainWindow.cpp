@@ -3717,6 +3717,14 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		info->ptMinTrackSize = { self->Scale(960), self->Scale(760) };
 		return 0;
 	}
+	case WM_APP + 71: {   // 教师端内置控制台输出
+		auto* text = reinterpret_cast<std::wstring*>(lParam);
+		if (text) {
+			self->AppendTeacherConsole(*text);
+			delete text;
+		}
+		return 0;
+	}
 	case WM_DPICHANGED: {
 		const UINT newDpi = HIWORD(wParam);
 		if (newDpi != 0) self->dpiScale = static_cast<double>(newDpi) / 96.0;
@@ -8852,36 +8860,22 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 		return;
 	}
 	if (currentLogger) currentLogger->LogInfo(L"teacher-gui launch: %s", executable.c_str());
-	std::wstring commandLine = L"\"" + executable + L"\"";
 	std::wstring workingDirectory = executable;
 	const size_t executableSlash = workingDirectory.find_last_of(L"\\/");
 	workingDirectory = executableSlash == std::wstring::npos ? base : workingDirectory.substr(0, executableSlash);
-	std::vector<wchar_t> command(commandLine.begin(), commandLine.end());
-	command.push_back(L'\0');
-	// 只有 FLTK 版教师端才有可嵌入的窗口；Python 版是控制台 REPL，
-	// 把控制台藏起来等于让它完全不可用。先按可见启动，真找到 FLTK
-	// 窗口时再由 FindTeacherWindow 把控制台隐藏。
-	STARTUPINFOW startup{ sizeof(startup) };
-	startup.dwFlags = STARTF_USESHOWWINDOW;
-	startup.wShowWindow = SW_SHOWNORMAL;
-	PROCESS_INFORMATION process{};
-	if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
-		CREATE_NEW_PROCESS_GROUP, nullptr, workingDirectory.c_str(), &startup, &process)) {
+	// 公开版是控制台程序：接管 stdin/stdout 做内置控制台；
+	// 若对端是 FLTK 版，AttachEmbeddedTeacherGui 会把它的窗口挂进来。
+	if (!StartTeacherConsoleProcess(executable, workingDirectory)) {
 		MessageBoxW(_hWnd, L"\u542f\u52a8\u6559\u5e08\u7aef\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 TeacherEndpoint \u6587\u4ef6\u548c\u4f9d\u8d56\u5e93\u3002", L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
 		return;
 	}
-	CloseHandle(process.hThread);
-	teacherProcess = process.hProcess;
-	teacherProcessId = process.dwProcessId;
-	teacherLaunchPending = true;
-	teacherLaunchDeadline = GetTickCount64() + 10000;
-	SetWindowTextW(teacherLaunchButton, L"\u53d6\u6d88\u542f\u52a8");
 	WaitForInputIdle(teacherProcess, 100);
 	AttachEmbeddedTeacherGui();
 }
 
 void MainWindow::StopEmbeddedTeacherGui()
 {
+	CloseTeacherConsole();
 	if (teacherChildWindow && IsWindow(teacherChildWindow)) PostMessageW(teacherChildWindow, WM_CLOSE, 0, 0);
 	if (teacherProcess) {
 		if (WaitForSingleObject(teacherProcess, 1200) == WAIT_TIMEOUT)
@@ -9348,6 +9342,10 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		}
 		LayoutTeacherControls();
 		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	if (command == 0x7C01) {   // 内置控制台的"发送"按钮
+		SendTeacherConsoleCommand();
 		return;
 	}
 	if (command == IDC_NET_TEACHER) {

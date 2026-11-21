@@ -196,6 +196,7 @@
 	<ClInclude Include="TeacherEndpoint\teacher_service.hpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="TeacherConsole.cpp" />
     <ClCompile Include="BugReportWindow.cpp" />
     <ClCompile Include="DzjsTrainerUI.cpp" />
     <ClCompile Include="MainWindow.cpp" />
