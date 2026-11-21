@@ -1,0 +1,106 @@
+name: release
+
+# 手动触发的完整打包流程：驱动 + Hook + 更新器 + 注入助手 + 主程序 + 便携包。
+# 与 ci.yml 的分工：ci 只做仓库自检和 Hook 编译，这里才产出可分发产物。
+#
+# 说明：驱动用 scripts/build-driver-wdk.cmd 直接调 cl/link，不依赖 VS 的 WDK
+# 工具集；因此 runner 上装 WDK（km 头/库）就够了。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "产物版本号（仅用于文件名）"
+        required: false
+        default: "dev"
+      make_zip:
+        description: "是否额外生成便携包 zip"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 WDK（提供 km 头与库）
+        shell: pwsh
+        run: |
+          $url = 'https://download.microsoft.com/download/41fb59c2-1723-45f9-a270-96b73ad58233/KIT_BUNDLE_WDK_MEDIACREATION/wdksetup.exe'
+          $out = Join-Path $env:RUNNER_TEMP 'wdksetup.exe'
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          $p = Start-Process -FilePath $out -ArgumentList '/quiet','/norestart','/features','+' -Wait -PassThru
+          "wdksetup exit=$($p.ExitCode)"
+          Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\Include" -Directory | ForEach-Object { $_.Name }
+
+      - name: 下载 Boost 头（TeacherEndpoint 需要）
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'boost.zip'
+          Invoke-WebRequest -Uri 'https://archives.boost.io/release/1.86.0/source/boost_1_86_0.zip' -OutFile $zip -UseBasicParsing
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'boost') -Force
+          "BOOST_ROOT=$(Join-Path $env:RUNNER_TEMP 'boost\boost_1_86_0')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 编译驱动
+        shell: cmd
+        run: scripts\build-driver-wdk.cmd
+
+      - name: 编译 AV 驱动
+        shell: cmd
+        run: scripts\build-av-driver-wdk.cmd
+
+      - name: 编译 Hook（x86 / x64）
+        shell: cmd
+        run: |
+          msbuild DzjsTrainerHooks\DzjsTrainerHooks.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:OutDir="%CD%\Release\\" /m /v:minimal
+          if errorlevel 1 exit /b 1
+          msbuild DzjsTrainerHooks\DzjsTrainerHooks.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%CD%\x64\Release\\" /m /v:minimal
+
+      - name: 编译更新器
+        shell: cmd
+        run: |
+          msbuild DzjsTrainerUpdater\DzjsTrainerUpdater.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:OutDir="%CD%\Release\\" /m /v:minimal
+          if errorlevel 1 exit /b 1
+          msbuild DzjsTrainerUpdater\DzjsTrainerUpdaterExe.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:OutDir="%CD%\Release\\" /m /v:minimal
+
+      - name: 编译 64 位注入助手
+        shell: cmd
+        run: |
+          if not exist x64\Release mkdir x64\Release
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cl /nologo /O2 /EHsc /MD /DUNICODE /D_UNICODE DzjsTrainerInjector64\DzjsTrainerInjector64.cpp /Fe:x64\Release\DzjsTrainerInjector64.exe /Fo:x64\Release\DzjsTrainerInjector64.obj
+
+      - name: 编译 UI 与主程序
+        shell: cmd
+        run: |
+          msbuild DzjsTrainerUI\DzjsTrainerUI.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:BoostIncludeDir="%BOOST_ROOT%" /p:OutDir="%CD%\Release\\" /m /v:minimal
+          if errorlevel 1 exit /b 1
+          msbuild DzjsTrainer\DzjsTrainer.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:BuildProjectReferences=false /p:OutDir="%CD%\Release\\" /p:IntDir="%CD%\Release\obj-main-Win32\\" /m /v:minimal
+
+      - name: 打包便携版
+        if: ${{ inputs.make_zip }}
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "bundle-${{ inputs.version }}"
+          ./tools/Build-PortableBundle.ps1 -OutputDir $out -Zip
+          Get-ChildItem $env:RUNNER_TEMP -Filter *.zip | ForEach-Object { "asset=$($_.FullName)" }
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: dzjs-build-${{ inputs.version }}
+          path: |
+            Release/DzjsTrainer.exe
+            Release/DzjsTrainerUpdater.exe
+            Release/DzjsTrainerHooks.dll
+            x64/Release/DzjsTrainerHooks.dll
+            x64/Release/DzjsTrainerInjector64.exe
+            Release/DzjsTrainerDriver/DzjsTrainerDriver.sys
+            JiYuAvRelease/JiYuAvKernel.sys
+            ${{ runner.temp }}/*.zip
+          if-no-files-found: warn
