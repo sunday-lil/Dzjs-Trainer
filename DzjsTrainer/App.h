@@ -124,6 +124,9 @@ private:
 	bool appNeedInstallIniTemple = false;
 	bool appIsInstaller = false;
 	bool appIsRecover = false;
+	// 看门狗用 --heartbeat-recovery 拉起恢复实例；与 -r1 不同，这里仍需等
+	// 旧实例释放单实例互斥体，否则会静默退出。
+	bool appIsHeartbeatRecovery = false;
 	bool appIsConfigMode = false;
 	bool appIsHiddenMode = false;
 	bool appIsBugReportMode = false;

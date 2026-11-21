@@ -751,10 +751,12 @@ int JTAppInternal::RunCheckRunningApp()//如果程序已经有一个在运行，
 	// 内置更新换完文件后会以 --after-update 重启自己；此时旧实例正在退出，
 	// 既不该把窗口拉起来（它已经在关了），也要等单实例互斥体释放。
 	const bool afterUpdate = wcsstr(GetCommandLineW(), L"--after-update") != nullptr;
+	// 看门狗的恢复实例：不抢前台窗口，但要等旧实例把互斥体放掉。
+	const bool heartbeatRecovery = appIsHeartbeatRecovery;
 	wchar_t modulePath[MAX_PATH]{};
 	GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
 	const bool nativePreviewBuild = wcsstr(modulePath, L"DzjsTrainer-TeacherNative") != nullptr;
-	if (!nativePreviewBuild && !uiAccessRestart && !afterUpdate) {
+	if (!nativePreviewBuild && !uiAccessRestart && !afterUpdate && !heartbeatRecovery) {
 		HWND oldWindow = FindWindow(MAIN_WND_CLS_NAME, MAIN_WND_NAME);
 		if (oldWindow != NULL) {
 			if (!IsWindowVisible(oldWindow)) ShowWindow(oldWindow, SW_SHOW);
@@ -764,7 +766,7 @@ int JTAppInternal::RunCheckRunningApp()//如果程序已经有一个在运行，
 		}
 	}
 	HANDLE hMutex = CreateMutex(NULL, FALSE, nativePreviewBuild ? L"JYTMutex-TeacherNative" : (uiAccessRestart ? L"JYTMutex-UIAccess" : L"JYTMutex"));
-	if (afterUpdate && hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+	if ((afterUpdate || heartbeatRecovery) && hMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
 		// 旧实例正在收尾（要卸驱动、落日志），最多等 20 秒。进程内换文件是
 		// "先起新版本、旧版本随后退出"，所以这段等待是常态而不是异常。
 		for (int attempt = 0; attempt < 80; ++attempt) {
@@ -1146,7 +1148,21 @@ void JTAppInternal::LoadDriver()
 		return;
 	}
 	if (!XLoadDriver()) {
-		currentLogger->LogWarn(L"启动时加载驱动失败");
+		const DWORD loadError = GetLastError();
+		// 577 = ERROR_INVALID_IMAGE_HASH，1275 = ERROR_DRIVER_BLOCKED。
+		// 这两种都是系统签名策略拒绝，重试没有意义：本次会话直接降级为无驱动模式，
+		// 并把可执行的解决办法写进日志，避免用户只看到一条 "加载失败"。
+		if (loadError == ERROR_INVALID_IMAGE_HASH || loadError == ERROR_DRIVER_BLOCKED) {
+			appForceNoDriver = true;
+			currentLogger->LogWarn2(
+				L"驱动被系统签名策略拒绝（错误 %lu），已切换为无驱动模式。"
+				L"窗口化、注入与画面替换不受影响；内核级功能不可用。"
+				L"要启用驱动请使用测试模式：关闭 Secure Boot 后执行 bcdedit /set testsigning on 并重启。",
+				static_cast<unsigned long>(loadError));
+		}
+		else {
+			currentLogger->LogWarn(L"启动时加载驱动失败（错误 %lu）", static_cast<unsigned long>(loadError));
+		}
 		return;
 	}
 	if (!appForceNoSelfProtect) {
@@ -1229,6 +1245,7 @@ void JTAppInternal::InitArgs()
 	if (FindArgInCommandLine(appArgList, appArgCount, L"b") != -1) appArgBreak = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"break") != -1) appArgBreak = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"r1") != -1) appIsRecover = true;
+	if (FindArgInCommandLine(appArgList, appArgCount, L"heartbeat-recovery") != -1) appIsHeartbeatRecovery = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"h") != -1) appIsHiddenMode = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"hidden") != -1) appIsHiddenMode = true;
 	if (FindArgInCommandLine(appArgList, appArgCount, L"config") != -1) appIsConfigMode = true;
