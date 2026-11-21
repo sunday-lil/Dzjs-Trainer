@@ -36,7 +36,7 @@ jobs:
           Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
           $p = Start-Process -FilePath $out -ArgumentList '/quiet','/norestart','/features','+' -Wait -PassThru
           "wdksetup exit=$($p.ExitCode)"
-          Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\Include" -Directory | ForEach-Object { $_.Name }
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | ForEach-Object { $_.Name }
 
       - name: 下载 Boost 头（TeacherEndpoint 需要）
         shell: pwsh
