@@ -90,3 +90,23 @@ update-server/publish-update.ps1 -ReleaseExe <产物路径>
 | 7 | `third_party/curl` 未参与编译，`DzjsTrainerUpdater/NetUtils.cpp` 未进工程 | 若要启用需自行接入并处理证书校验 |
 
 修其中任何一条都算功能改动，请按 `CONTRIBUTING.md` 单独提 PR 并说明验证方式。
+
+## 六、GitHub Actions 发布流程（本分支新增）
+
+`release.yml` 手动触发，参数是版本号和是否打包：
+
+```powershell
+gh workflow run release.yml --ref main -f version=1.0.5.2-dzjsfix1 -f make_zip=true
+```
+
+链路：装 WDK（官方 `wdksetup.exe /quiet /features +`）→ 下 Boost 1.86 → 两个驱动 → Hook x86/x64 →
+更新器 → 注入助手 → UI（`-p:BoostIncludeDir`）→ 主程序 → `tools/Build-PortableBundle.ps1` →
+上传 artifact。
+
+需要注意：
+
+- runner 上 **没有签名证书**，产物里的驱动是未签名的，只能用于验证构建；分发前要在本地跑
+  `scripts/Sign-Drivers.ps1` 再重链主程序。
+- WDK 安装约 3 分钟、Boost 解压约 1 分钟，整条链 15–25 分钟。
+- 若 WDK 安装失败，先看该步骤日志里的 `wdksetup exit=`；退出码 0 但后续找不到头文件时，检查
+  `${env:ProgramFiles(x86)}\Windows Kits\10\Include` 下有没有 `km`。

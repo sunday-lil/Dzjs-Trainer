@@ -48,6 +48,8 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 | [docs/REPO-LAYOUT.md](docs/REPO-LAYOUT.md) | 目录职责与不可移动的构建绑定文件 |
 | [docs/DRIVER-SIGNATURE-POLICY.md](docs/DRIVER-SIGNATURE-POLICY.md) | 驱动发布者白名单与内核 guard 规则 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 提交流程、代码风格、禁提交清单 |
+| [docs/EDITION.md](docs/EDITION.md) | 本社区修复版与上游的差异、构建与限制 |
+| [docs/LAB-DEPLOY.md](docs/LAB-DEPLOY.md) | 机房部署：无驱动模式、测试签名、还原卡注意事项 |
 
 ## 架构
 

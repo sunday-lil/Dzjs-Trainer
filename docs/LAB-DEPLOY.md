@@ -69,4 +69,6 @@ powershell -ExecutionPolicy Bypass -File scripts\Deploy-Lab.ps1 `
 
 - 无驱动时教师端若用内核手段强制结束进程，只能靠用户态重启，防不住；
 - 高 DPI 目前主界面已清晰，选图/日志导出/退出确认三个独立对话框仍是 96 DPI；
-- 教师端（`TeacherEndpoint\JiYuTeacherGui.exe`）是 Python 控制台程序，独立窗口运行，不嵌入主界面；只有私有的 FLTK 版才能嵌入。
+- 教师端（`TeacherEndpoint\JiYuTeacherGui.exe`）是 Python 控制台程序：主界面会用内置控制台接管它的
+  stdin/stdout（日志框 + 命令行 + 发送按钮），因此不再需要单独的窗口；只有私有的 FLTK 版才是原生嵌入。
+- 错误报告不再"提交"到服务器：点确定会把内容存到桌面并打开文件，由使用者自行转交。

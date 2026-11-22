@@ -116,3 +116,15 @@ python tools\verify_repo.py --strict
 ```
 
 检查冲突标记、资源/`#include` 路径、误提交产物、解决方案成员、根目录条目。
+
+## GitHub Actions
+
+仓库自带两条流水线，都不需要本地环境：
+
+| 工作流 | 触发 | 做什么 |
+| --- | --- | --- |
+| `ci.yml` | push / PR / 手动 | 仓库自检（`tools/verify_repo.py --strict`）、脚本语法（PowerShell / PHP / Python）、Hook 的 x86 与 x64 编译 |
+| `release.yml` | 手动（可填版本号） | 用官方引导器装 WDK、下载 Boost，然后编驱动、AV 驱动、Hook、更新器、注入助手、UI、主程序，最后打便携包并上传产物 |
+
+`release.yml` 里的驱动编译走 `scripts/build-driver-wdk.cmd`，不依赖 VS 的 WDK 工具集，所以在只装了
+WDK 的 runner 上也能过。产物未签名——签名仍需在本地用 `scripts/Sign-Drivers.ps1` 完成。

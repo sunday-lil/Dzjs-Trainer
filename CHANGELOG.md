@@ -2,6 +2,43 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.5.2-dzjsfix1] - 2026-11-21
+
+### Added
+
+- Built-in console host for the teacher endpoint: the public build is a console program with no
+  FLTK window, so embedding used to end in a 10 s timeout. The child's stdin/stdout are now piped
+  into a log view, a command line and a send button inside the network page; an FLTK build still
+  gets its real window attached.
+- `docs/LAB-DEPLOY.md` and `scripts/Deploy-Lab.ps1`: computer-lab deployment (copy, write
+  `DisableDriver`, optional shortcut and test signing, verification checklist).
+- `scripts/Sign-Drivers.ps1`: sign both drivers by store thumbprint or PFX, print the publisher and
+  thumbprint the client policy needs.
+- `docs/EDITION.md`: what this fork changes relative to upstream.
+- GitHub Actions: `ci.yml` (repo hygiene, script syntax, hooks x86/x64) and `release.yml`
+  (WDK + Boost, drivers, hooks, updater, injector, UI, main, portable bundle).
+
+### Changed
+
+- The process declares Per-Monitor V2 awareness and scales the main window by DPI; previously the
+  whole window was bitmap-stretched on scaled displays.
+- A driver rejected by the signature policy (577 / 1275) switches the session to no-driver mode and
+  logs the remedy instead of only "启动时加载驱动失败".
+- The bug report dialog writes its content to `桌面\DzjsTrainer-bugreport-<time>.txt`; it used to
+  `Sleep(2000)` and claim the report had been submitted.
+- The teacher endpoint is launched without `CREATE_NO_WINDOW` so a console-only build stays usable
+  when it cannot be embedded.
+
+### Fixed
+
+- `WM_LBUTTONDBLCLK` never arrived in the media picker (missing `CS_DBLCLKS`), so double-clicking a
+  folder did nothing (upstream issue #4).
+- `--heartbeat-recovery` was not parsed: the watchdog's replacement instance hit the single-instance
+  check and exited silently.
+- `TIMER_RERUN` collided with `TIMER_TRAY_REPAIR` (both 21).
+- Teacher endpoint path resolution used a fixed `MAX_PATH` buffer and logged nothing on failure; it
+  now uses a 32K buffer and logs every candidate with its attribute mask and Win32 error.
+
 ## [1.0.5.2] - 2026-11-15
 
 ### Added

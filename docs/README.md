@@ -9,6 +9,8 @@ Dzjs Trainer 是 JiYu Trainer 的翻新版：面向**经授权**的教学机房�
 | [REPO-LAYOUT](REPO-LAYOUT.md) | 目录职责、哪些文件必须在根目录、为什么有 `third_party/` 与 `legacy-x86/` | 找文件、提 PR 前 |
 | [BUILD](BUILD.md) | 从零复现构建的**真实**顺序与四个已知缺口 | 要编译 |
 | [RELEASE-PIPELINE](RELEASE-PIPELINE.md) | 签名、打包、更新服务、站点同步的现状与断点 | 要发版 |
+| [EDITION](EDITION.md) | 本社区修复版与上游的差异、构建与限制 | 想知道改了什么 |
+| [LAB-DEPLOY](LAB-DEPLOY.md) | 机房部署：无驱动模式、测试签名、还原卡 | 要装机房 |
 | [DRIVER-SIGNATURE-POLICY](DRIVER-SIGNATURE-POLICY.md) | 驱动发布者白名单与内核 guard 的规则 | 改驱动加载逻辑 |
 | [CONTRIBUTING](../CONTRIBUTING.md) | 提交流程、代码风格、禁提交清单、自检命令 | 要提 PR |
 | [CHANGELOG](../CHANGELOG.md) | 版本变更历史 | 查某行为是哪版引入的 |
