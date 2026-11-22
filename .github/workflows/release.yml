@@ -28,6 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 准备 MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       - name: 安装 WDK（提供 km 头与库）
         shell: pwsh
         run: |
@@ -72,7 +75,15 @@ jobs:
         shell: cmd
         run: |
           if not exist x64\Release mkdir x64\Release
-          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          set "VCVARS="
+          for %%D in ("C:\Program Files\Microsoft Visual Studio\2022\Enterprise" "C:\Program Files\Microsoft Visual Studio\2022\Professional" "C:\Program Files\Microsoft Visual Studio\2022\Community" "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools") do (
+            if exist "%%~D\VC\Auxiliary\Build\vcvarsall.bat" set "VCVARS=%%~D\VC\Auxiliary\Build\vcvarsall.bat"
+          )
+          if not defined VCVARS (
+            echo vcvarsall.bat not found
+            exit /b 1
+          )
+          call "%VCVARS%" x64
           cl /nologo /O2 /EHsc /MD /DUNICODE /D_UNICODE DzjsTrainerInjector64\DzjsTrainerInjector64.cpp /Fe:x64\Release\DzjsTrainerInjector64.exe /Fo:x64\Release\DzjsTrainerInjector64.obj
 
       - name: 编译 UI 与主程序
