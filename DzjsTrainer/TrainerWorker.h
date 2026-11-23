@@ -146,8 +146,8 @@ private:
 	bool RunInjector64(DWORD pid, LPCWSTR dllPath, bool unload, std::wstring* status);
 	void UnloadAllCustomInjected();
 
-	HHOOK hMsgBoxHook;
-	HWND hWndMain;
+	HHOOK hMsgBoxHook = nullptr;
+	HWND hWndMain = nullptr;
 
 	bool setAllowGbTop = false;
 	bool setAutoIncludeFullWindow = false;
@@ -162,7 +162,7 @@ private:
 	bool _FirstBlackScreenWindow = false;
 	int _LastResolveWindowCount = 0;
 	bool _FakeBroadcastFull = false, _FakeBlackScreenFull = false;
-	HWND _CurrentBroadcastWnd, _CurrentBlackScreenWnd;
+	HWND _CurrentBroadcastWnd = nullptr, _CurrentBlackScreenWnd = nullptr;
 
 	bool RunCk();
 	void RunResetPid();

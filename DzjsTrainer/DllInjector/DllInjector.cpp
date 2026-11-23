@@ -70,6 +70,7 @@ Result InjectDll(HANDLE process, const wchar_t* dll_path)
     }
 
     bool ok = false;
+    bool thread_completed = false;
     auto* loader = reinterpret_cast<LPTHREAD_START_ROUTINE>(
         GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"));
     if (!loader) {
@@ -80,6 +81,7 @@ Result InjectDll(HANDLE process, const wchar_t* dll_path)
     }
     else {
         const RemoteThreadResult thread = RunRemoteThread(process, loader, remote_buffer);
+        thread_completed = thread.completed;
         result.error = thread.last_error;
         result.remote_exit_code = thread.exit_code;
         // LoadLibraryW returns the module handle; zero means it failed inside
@@ -87,7 +89,14 @@ Result InjectDll(HANDLE process, const wchar_t* dll_path)
         ok = thread.completed && thread.exit_code != 0;
     }
 
-    VirtualFreeEx(process, remote_buffer, 0, MEM_RELEASE);
+    // 只有远程线程确实结束了才能释放：超时后它可能还在 LoadLibraryW 里
+    // 读这块路径，释放会让目标进程 use-after-free。
+    if (thread_completed) {
+        VirtualFreeEx(process, remote_buffer, 0, MEM_RELEASE);
+    }
+    else if (result.error == ERROR_SUCCESS) {
+        result.error = ERROR_TIMEOUT;
+    }
     result.success = ok;
     return result;
 }

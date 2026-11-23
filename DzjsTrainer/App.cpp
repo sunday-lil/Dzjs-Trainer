@@ -694,7 +694,8 @@ void JTAppInternal::CloseSourceDir() {
 		HANDLE hDir = CreateFile(fullSourceInstallerDir.c_str(), GENERIC_READ,
 			FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 		if (hDir != INVALID_HANDLE_VALUE) {
-			NtClose(hDir);
+			// 这里原来连着 NtClose 了两次；句柄值可能已被其它线程复用，
+			// 第二次关闭会误关别人的句柄。
 			NtClose(hDir);
 		}
 	}

@@ -185,7 +185,8 @@ void TrainerWorkerInternal::HandleMessageFromVirus(LPCWSTR buf)
 			else if (arr[1] == L"showhelp" && _Callback) _Callback->OnShowHelp();
 			else if (arr[1] == L"wtf") {
 				//插入了错误的目标，现在重置状态
-				DWORD pid = _wtol(arr[2].c_str());
+				// 消息来自任意进程（WM_COPYDATA），只有两段时 arr[2] 是越界访问。
+				DWORD pid = arr.size() > 2 ? static_cast<DWORD>(_wtol(arr[2].c_str())) : 0;
 				AddFilterdPid(pid);
 
 				if (_StudentMainFileLocatedByProcess)
@@ -536,6 +537,13 @@ bool TrainerWorkerInternal::FindProcess(LPCWSTR processName, DWORD * outPid)
 }
 bool TrainerWorkerInternal::KillProcess(DWORD pid, bool force)
 {
+	// 入参 pid 之前被忽略，函数体一直按 _StudentMainPid 操作：
+	// 传别的 pid 会杀错进程，_StudentMainPid 为 0 时还会误报“已结束”。
+	const DWORD targetPid = pid != 0 ? pid : _StudentMainPid;
+	if (targetPid == 0) {
+		currentLogger->LogWarn(L"KillProcess: 没有可用的目标进程");
+		return false;
+	}
 	const std::wstring mode = currentApp->GetSettings()->GetSettingStr(L"KillProcess", L"NtTerminateProcess");
 	if (mode == L"TerminateProcess") {
 		HANDLE process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
@@ -565,7 +573,7 @@ bool TrainerWorkerInternal::KillProcess(DWORD pid, bool force)
 	}
 
 	HANDLE hProcess;
-	NTSTATUS status = MOpenProcessNt(_StudentMainPid, &hProcess);
+	NTSTATUS status = MOpenProcessNt(targetPid, &hProcess);
 	if (!NT_SUCCESS(status)) {
 		if (status == STATUS_INVALID_CID || status == STATUS_INVALID_HANDLE) {
 			currentLogger->LogError2(L"找不到进程 [%d] ", pid);
@@ -602,7 +610,7 @@ bool TrainerWorkerInternal::KillProcess(DWORD pid, bool force)
 FORCEKILL:
 	if (XDriverLoaded())
 	{
-		if (KForceKill(_StudentMainPid, &status)) {
+		if (KForceKill(targetPid, &status)) {
 			currentLogger->Log(L"进程 [%d] 强制结束成功", pid);
 			CloseHandle(hProcess);
 			return true;
@@ -633,7 +641,9 @@ bool TrainerWorkerInternal::ReadTopDomanPassword(BOOL forceKnock)
 		if (StrEqual(Data, L"Passwd[123456]")) goto READ_EX; //6.0以后读取不了了，都显示Passwd[123456]，用新的方法读取
 		else {
 			_TopDomainPassword = Data;
-			_TopDomainPassword = _TopDomainPassword.substr(6, _TopDomainPassword.size() - 6);
+			// 值短于 6 个字符时 size()-6 会下溢，substr 直接抛 out_of_range。
+			if (_TopDomainPassword.size() > 6)
+				_TopDomainPassword = _TopDomainPassword.substr(6);
 			return true;
 		}
 
@@ -817,7 +827,7 @@ void TrainerWorkerInternal::ClearFilterdPid()
 {
 	if (current_system_process)
 	{
-		for (auto it = incorrectStudentMainPids.begin(); it != incorrectStudentMainPids.end(); it++) {
+		for (auto it = incorrectStudentMainPids.begin(); it != incorrectStudentMainPids.end(); ) {
 			auto pid = (*it).pid;
 			bool founded = false;
 			bool done = false;
@@ -829,8 +839,10 @@ void TrainerWorkerInternal::ClearFilterdPid()
 				}
 				done = p->NextEntryOffset == 0;
 			}
-			if (!founded) 
-				it = incorrectStudentMainPids.erase(it);
+			if (!founded)
+				it = incorrectStudentMainPids.erase(it);   // erase 已经返回下一个元素
+			else
+				++it;
 		}
 	}
 }
@@ -1560,22 +1572,24 @@ bool UnDecryptJiyuKnock(BYTE* Data, DWORD cbData, WCHAR* ss)
 			i += 4;
 		}
 		WORD v4[34];
-		v4[0] = 0;
-		memset(&v4[1], 0, 0x40u);
-
-		int a1 = (int)&v4;
-
-		int v13; // edi
-		BYTE *v14; // eax
-		__int16 v15; // cx
-		v13 = a1 - Data[0];
-		v14 = &Data[Data[0]];
-		do
+		memset(v4, 0, sizeof(v4));
+		// 原实现按 Data[0] 做偏移、按 0 字结束，没有长度上限：
+		// 注册表值被改过就会越界读、并把栈写穿。这里改成显式定界。
+		const DWORD offset = Data[0];
+		if (cbData < 2 || offset >= cbData)
+			return false;
+		const BYTE* src = Data + offset;
+		const BYTE* end = Data + cbData;
+		size_t count = 0;
+		while (src + 1 < end && count + 1 < _countof(v4))
 		{
-			v15 = *(WORD *)v14;
-			*(WORD *)&v14[v13 - (DWORD)Data] = *(WORD *)v14;
-			v14 += 2;
-		} while (v15);
+			WORD value = 0;
+			memcpy(&value, src, sizeof(value));
+			v4[count++] = value;
+			src += 2;
+			if (value == 0) break;
+		}
+		v4[count < _countof(v4) ? count : _countof(v4) - 1] = 0;
 
 
 		for (int i = 0; i < 32; i++) ss[i] = v4[i];

@@ -59,13 +59,15 @@ BOOL MRegReadKeyString64And32(HKEY hRootKey, LPCWSTR path32, LPCWSTR path64, LPC
 	if (lastError == ERROR_SUCCESS) {
 		DWORD dwType = REG_SZ;
 		WCHAR * Data = new WCHAR[count];
-		DWORD cbData = count;
-		lastError = RegQueryValueEx(hKey, keyName, 0, &dwType, (LPBYTE)Data, &cbData);		
+		// cbData 是字节数；原来传字符数，长于 count/2 个字符的值永远读不到。
+		DWORD cbData = static_cast<DWORD>(count * sizeof(WCHAR));
+		lastError = RegQueryValueEx(hKey, keyName, 0, &dwType, (LPBYTE)Data, &cbData);
 		if (lastError == ERROR_SUCCESS) {
+			Data[count - 1] = L'\0';
 			wcscpy_s(buffer, count, Data);
 			rs = TRUE;
 		}
-		delete Data;
+		delete[] Data;
 		RegCloseKey(hKey);
 	}
 	SetLastError(lastError);
@@ -78,13 +80,14 @@ BOOL MRegReadKeyString(HKEY hRootKey, LPCWSTR path, LPCWSTR keyName, LPWSTR buff
 	if (lastError == ERROR_SUCCESS) {
 		DWORD dwType = REG_SZ;
 		WCHAR * Data = new WCHAR[count];
-		DWORD cbData = count;
+		DWORD cbData = static_cast<DWORD>(count * sizeof(WCHAR));
 		lastError = RegQueryValueEx(hKey, keyName, 0, &dwType, (LPBYTE)Data, &cbData);
 		if (lastError == ERROR_SUCCESS) {
+			Data[count - 1] = L'\0';
 			wcscpy_s(buffer, count, Data);
 			rs = TRUE;
 		}
-		delete Data;
+		delete[] Data;
 		RegCloseKey(hKey);
 	}
 	SetLastError(lastError);
