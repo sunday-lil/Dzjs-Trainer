@@ -36,6 +36,12 @@
 - **CI / 发布**：`.github/workflows/ci.yml` 做仓库自检与 Hook 双平台编译；`release.yml` 在处理机上
   装 WDK 与 Boost，编译驱动/Hook/更新器/注入助手/UI/主程序并打包上传。
 
+### 静态审计修复（2026-11-23）
+
+一轮针对用户态、UI、Hook、内核驱动和更新链的审计，修掉了若干内存安全、句柄生命周期、授权与
+DPI 布局问题；逐条记录见 `CHANGELOG.md` 的 `dzjsfix2` 段。确认存在但这一轮没动的结构性问题是
+[SECURITY-NOTES.md](SECURITY-NOTES.md)，按优先级排了序。
+
 ## 构建
 
 见 [BUILD.md](BUILD.md)。要点：先编驱动和 Hook（含 x64），再编注入助手与更新器，最后编主程序——`.rc` 会把它们作为资源嵌入。

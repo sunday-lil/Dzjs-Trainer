@@ -11,6 +11,7 @@ Dzjs Trainer 是 JiYu Trainer 的翻新版：面向**经授权**的教学机房�
 | [RELEASE-PIPELINE](RELEASE-PIPELINE.md) | 签名、打包、更新服务、站点同步的现状与断点 | 要发版 |
 | [EDITION](EDITION.md) | 本社区修复版与上游的差异、构建与限制 | 想知道改了什么 |
 | [LAB-DEPLOY](LAB-DEPLOY.md) | 机房部署：无驱动模式、测试签名、还原卡 | 要装机房 |
+| [SECURITY-NOTES](SECURITY-NOTES.md) | 审计确认但未修的问题与修复优先级 | 要接着改 |
 | [DRIVER-SIGNATURE-POLICY](DRIVER-SIGNATURE-POLICY.md) | 驱动发布者白名单与内核 guard 的规则 | 改驱动加载逻辑 |
 | [CONTRIBUTING](../CONTRIBUTING.md) | 提交流程、代码风格、禁提交清单、自检命令 | 要提 PR |
 | [CHANGELOG](../CHANGELOG.md) | 版本变更历史 | 查某行为是哪版引入的 |

@@ -2,6 +2,56 @@
 
 All notable changes to Dzjs Trainer are documented in this file.
 
+## [1.0.5.2-dzjsfix2] - 2026-11-23
+
+静态审计一轮后修的缺陷，全部为健壮性/正确性修复，没有新增功能。
+
+### Fixed — 用户态核心
+
+- `UnDecryptJiyuKnock`：按 `Data[0]` 偏移、按 0 字结束且没有长度上限，注册表值被改过就能越界读并写穿
+  栈缓冲区；改为显式定界并封顶 34 个 WORD。
+- `HandleMessageFromVirus`：`wtf` 分支在只有两段时仍取 `arr[2]`（任意进程可发 `WM_COPYDATA` 触发）。
+- `KillProcess`：忽略入参 `pid`，一直按 `_StudentMainPid` 操作；现在参数优先，PID 为 0 时直接失败。
+- `ClearFilterdPid`：`erase(it)` 之后仍 `it++`，会跳过元素并在末尾越界。
+- `ReadTopDomanPassword`：值短于 6 字符时 `size()-6` 下溢，`substr` 抛异常导致崩溃。
+- `CloseSourceDir`：同一个句柄连续 `NtClose` 两次，第二次可能误关被复用的句柄。
+- `MRegReadKeyString` / `MRegReadKeyString64And32`：`cbData` 传的是字符数而不是字节数，长值永远读不到；
+  `new[]` 配 `delete`，且未保证 NUL 结尾。
+- `TrainerWorker`：`hWndMain`、`_CurrentBroadcastWnd`、`_CurrentBlackScreenWnd` 未初始化。
+- `DllInjector`：远程线程超时后仍 `VirtualFreeEx`，目标进程可能仍在读路径字符串。
+
+### Fixed — Hook / 内核
+
+- `JdrvHeartbeat`：METHOD_BUFFERED 下请求与响应共用缓冲，先清零响应把 `version` 一起抹掉，
+  心跳永远 `STATUS_REVISION_MISMATCH`；改为先取请求字段再清零。
+- `JiYuAvKernel`：`DriverObject->MajorFunction` 只填了三个，其余为 NULL，`ReadFile` 等会 call NULL；
+  补上兜底分发。
+- Hook 卸载：`WaitForDrain` 超时结果只写日志，随后仍释放全部 trampoline；现在超时则不释放。
+- `WM_STATUS_APPEND`：任意进程 `SendMessage` 一个地址进来会被 `delete[]`；改为握手值 + 同进程校验。
+- `GuardProcess`：注入超时后释放远端路径缓冲，与 `DllInjector` 同类问题，已一并修正。
+
+### Fixed — 更新与 UI
+
+- 回滚：`DeleteFile && MoveFileEx` 短路，删除失败就不还原；改为先 `MOVEFILE_REPLACE_EXISTING`。
+- `.old` 清理：任何进程启动就删全部 `.old`，把唯一回滚副本也删了；10 分钟内的不再清理。
+- 清单：`version/url/sha256` 未转义，`url` 可注入第二行 `sha256=`；写入转义、解析改为重复键只认第一次。
+- 清单响应体没有上限（提权进程里可被无限流打爆内存），加 4 MiB 上限。
+- 临时更新包文件名直接拼 `version`（可含 `..`/分隔符），改为白名单字符。
+- 错误报告：按 ANSI 读 UTF-8 日志导致中文乱码；固定 32K 缓冲静默截断；`EndDialog` 后才读勾选框，
+  重启分支从未执行。
+- 教师端：`LayoutTeacherControls` 里 `return;` 使其后的布局全部不可达（刷新/画面/聊天/锁屏按钮永远不可见）；
+  宿主框在控制台模式下从不显示；发送按钮挂在 STATIC 上 `WM_COMMAND` 到不了主窗口；关闭时先关管道再等读线程。
+- 高 DPI：进程选择器原生输入框按物理坐标定位、绘制按逻辑坐标；教师端/网络页控件未随 `dpiScale` 缩放。
+- `StopAvProcessScan`：`INFINITE` 等待会让退出永久卡在 `WM_DESTROY`，改为 5 秒超时。
+- 预览图：逐像素处理没有尺寸上限，小体积 JPEG 可声明超大尺寸锁死教师端；加 8192 边长 / 4000 万像素上限。
+
+### Fixed — 脚本
+
+- `Complete-DriverSigning.ps1` 第二次运行会因令牌已存在而中断（缺 `-Force`）。
+- `Deploy-Lab.ps1` 不检查 `bcdedit` 退出码，失败也打印"已设置"。
+- 打包/部署脚本用 `Set-Content -Encoding UTF8` 写 ini（带 BOM），`GetPrivateProfileString` 读不到第一段。
+- `Build-PortableBundle.ps1` 的清理没有白名单，改为只允许 `dist/` 下的目录。
+
 ## [1.0.5.2-dzjsfix1] - 2026-11-21
 
 ### Added
