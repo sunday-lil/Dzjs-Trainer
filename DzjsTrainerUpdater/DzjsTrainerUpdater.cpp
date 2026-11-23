@@ -98,9 +98,9 @@ static void ParseManifestText(const std::string& text, JUpdaterManifestInfo* inf
 					}
 				}
 				notes = restored;
-			} else if (key == "version") version = value;
-			else if (key == "sha256") sha256 = value;
-			else if (key == "url") url = value;
+			} else if (key == "version") { if (version.empty()) version = value; }
+			else if (key == "sha256") { if (sha256.empty()) sha256 = value; }
+			else if (key == "url") { if (url.empty()) url = value; }
 		}
 		if (end == std::string::npos) break;
 		begin = end + 1;

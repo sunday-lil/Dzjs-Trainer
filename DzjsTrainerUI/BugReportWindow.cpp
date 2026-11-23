@@ -32,22 +32,42 @@ INT_PTR CALLBACK BugReportDlgFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM
 		int argFIndex = currentApp->FindArgInCommandLine(appArgList, appArgCount, L"bugfile");
 		if (argFIndex >= 0 && (argFIndex + 1) < appArgCount) {
 			LPCWSTR bugFilePath = appArgList[argFIndex + 1];
-			CHAR szTest[1000];
-			memset(szTest, 0, sizeof(szTest));
-			std::string bugReportContent;
-			int len = 0;
-			FILE *fp = NULL;
-			_wfopen_s(&fp, bugFilePath, L"r");
-			if (NULL != fp)
-			{
-				while (fgets(szTest, 1000, fp) != NULL)
-				{
-					bugReportContent += szTest;
-					memset(szTest, 0, sizeof(szTest));
+			// 日志是 UTF-8 写的，原来用 _wfopen_s(..., L"r") + fgets + SetDlgItemTextA
+			// 按 ANSI 解释，中文全部变成乱码并被原样存进报告。
+			HANDLE logFile = CreateFileW(bugFilePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+				nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (logFile != INVALID_HANDLE_VALUE) {
+				LARGE_INTEGER size{};
+				std::string bytes;
+				if (GetFileSizeEx(logFile, &size) && size.QuadPart > 0 && size.QuadPart < (16 << 20)) {
+					bytes.resize(static_cast<size_t>(size.QuadPart));
+					DWORD read = 0;
+					if (!ReadFile(logFile, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr))
+						bytes.clear();
+					else
+						bytes.resize(read);
 				}
-				fclose(fp);
-
-				SetDlgItemTextA(hDlg, IDC_BUGREPORT_CONTENT, bugReportContent.c_str());
+				CloseHandle(logFile);
+				if (!bytes.empty()) {
+					// 去掉 UTF-8 BOM，再按 UTF-8 解码；解不出来就退回 ACP。
+					const bool hasBom = bytes.size() >= 3 &&
+						static_cast<unsigned char>(bytes[0]) == 0xEF &&
+						static_cast<unsigned char>(bytes[1]) == 0xBB &&
+						static_cast<unsigned char>(bytes[2]) == 0xBF;
+					const char* data = hasBom ? bytes.data() + 3 : bytes.data();
+					const int dataSize = static_cast<int>(bytes.size() - (hasBom ? 3 : 0));
+					UINT codePage = CP_UTF8;
+					int wideLength = MultiByteToWideChar(CP_UTF8, 0, data, dataSize, nullptr, 0);
+					if (wideLength <= 0) {
+						codePage = CP_ACP;
+						wideLength = MultiByteToWideChar(CP_ACP, 0, data, dataSize, nullptr, 0);
+					}
+					if (wideLength > 0) {
+						std::wstring text(static_cast<size_t>(wideLength), L'\0');
+						MultiByteToWideChar(codePage, 0, data, dataSize, text.data(), wideLength);
+						SetDlgItemTextW(hDlg, IDC_BUGREPORT_CONTENT, text.c_str());
+					}
+				}
 			}
 		}
 
@@ -59,10 +79,12 @@ INT_PTR CALLBACK BugReportDlgFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM
 		case IDOK: {
 			// 这个程序从来没有上报接口，原来的"已成功提交"只是 Sleep(2000) 后
 			// 弹一句话。改成把内容真正存成文件，用户自己转给维护者。
-			std::wstring content(32768, L'\0');
-			const int length = GetDlgItemTextW(hDlg, IDC_BUGREPORT_CONTENT, content.data(),
-				static_cast<int>(content.size()));
-			content.resize(length > 0 ? static_cast<size_t>(length) : 0);
+			// 按实际长度取，不再固定 32K：超长日志原先会被静默截断，
+			// 界面却仍然提示"已保存"。
+			const int length = GetWindowTextLengthW(GetDlgItem(hDlg, IDC_BUGREPORT_CONTENT));
+			std::wstring content(static_cast<size_t>(length) + 1, L'\0');
+			GetDlgItemTextW(hDlg, IDC_BUGREPORT_CONTENT, content.data(), length + 1);
+			content.resize(static_cast<size_t>(length));
 
 			SYSTEMTIME now{};
 			GetLocalTime(&now);
@@ -104,8 +126,11 @@ INT_PTR CALLBACK BugReportDlgFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM
 			else {
 				MessageBox(hDlg, L"保存错误报告失败，请检查桌面目录是否可写。", L"Dzjs Trainer", MB_ICONEXCLAMATION);
 			}
+			// 必须先读勾选状态再 EndDialog：对话框销毁后 IsDlgButtonChecked
+			// 恒为 0，重启分支以前从来没执行过。
+			const bool reboot = IsDlgButtonChecked(hDlg, IDC_REBOOT) == BST_CHECKED;
 			EndDialog(hDlg, LOWORD(wParam));
-			if (IsDlgButtonChecked(hDlg, IDC_REBOOT))
+			if (reboot)
 				SysHlp::RunApplication(currentApp->GetFullPath(), L"-r3");
 			return TRUE;
 		}

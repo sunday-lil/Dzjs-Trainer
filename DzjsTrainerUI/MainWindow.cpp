@@ -5190,14 +5190,18 @@ void MainWindow::PositionProcessPickerSearchEdit()
 	if (!processPickerSearchEdit || !ProcessPickerVisible()) return;
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	const PickerGeometry geom = ComputePickerGeometry(client.right, client.bottom);
+	// 绘制用逻辑坐标再整体 ScaleTransform，这里必须换算成物理像素，
+	// 否则 150% 缩放下原生 EDIT 会落在自绘卡片左上角。
+	const double scale = dpiScale > 0 ? dpiScale : 1.0;
+	const PickerGeometry geom = ComputePickerGeometry(
+		static_cast<int>(client.right / scale), static_cast<int>(client.bottom / scale));
 	RECT target{};
-	target.left = static_cast<LONG>(geom.search.X);
-	target.top = static_cast<LONG>(geom.search.Y);
-	target.right = static_cast<LONG>(geom.search.GetRight());
-	target.bottom = static_cast<LONG>(geom.search.GetBottom());
-	// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 7 像素，贴边会把圆角削掉。
-	InflateRect(&target, -10, -7);
+	target.left = Scale(static_cast<int>(geom.search.X));
+	target.top = Scale(static_cast<int>(geom.search.Y));
+	target.right = Scale(static_cast<int>(geom.search.GetRight()));
+	target.bottom = Scale(static_cast<int>(geom.search.GetBottom()));
+	// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 7 逻辑像素，贴边会把圆角削掉。
+	InflateRect(&target, -Scale(10), -Scale(7));
 	RECT current{};
 	GetWindowRect(processPickerSearchEdit, &current);
 	MapWindowPoints(HWND_DESKTOP, _hWnd, reinterpret_cast<POINT*>(&current), 2);
@@ -7087,9 +7091,16 @@ void MainWindow::StopAvProcessScan()
 {
 	if (avScanCancelEvent) SetEvent(avScanCancelEvent);
 	if (avScanThread) {
-		WaitForSingleObject(avScanThread, INFINITE);
-		CloseHandle(avScanThread);
-		avScanThread = nullptr;
+		// 取消只靠驱动协作响应，INFINITE 等待会让退出流程永久卡在
+		// WM_DESTROY 里。等不到就放弃这个句柄，让进程正常退出。
+		const DWORD waitResult = WaitForSingleObject(avScanThread, 5000);
+		if (waitResult == WAIT_OBJECT_0) {
+			CloseHandle(avScanThread);
+			avScanThread = nullptr;
+		}
+		else if (currentLogger) {
+			currentLogger->LogWarn(L"AV scan thread did not stop within 5s; leaving it detached");
+		}
 	}
 	if (avScanCancelEvent) {
 		CloseHandle(avScanCancelEvent);
@@ -8159,8 +8170,16 @@ void MainWindow::StartUpdateDownload()
 		FailUpdateDialog(L"无法取得临时目录");
 		return;
 	}
+	// version 来自远端清单，直接拼进路径等于让清单决定删/写哪个文件。
+	std::wstring safeVersion;
+	for (wchar_t ch : updateDialog.version) {
+		const bool ok = (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'z') ||
+			(ch >= L'A' && ch <= L'Z') || ch == L'.' || ch == L'-' || ch == L'_';
+		safeVersion.push_back(ok ? ch : L'_');
+	}
+	if (safeVersion.empty()) safeVersion = L"latest";
 	const std::wstring packagePath = std::wstring(tempDir) +
-		L"DzjsTrainer-" + updateDialog.version + L"-update.exe";
+		L"DzjsTrainer-" + safeVersion + L"-update.exe";
 	DeleteFileW(packagePath.c_str());
 
 	auto* context = new (std::nothrow) UpdateDownloadContext();
@@ -8532,42 +8551,36 @@ void MainWindow::LayoutNetworkControls()
 void MainWindow::LayoutTeacherControls()
 {
 	if (!teacherLaunchButton) return;
-	{
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	const bool visible = page == Page::Network;
-	const int hostX = 264;
-	const int hostY = 170;
-	const int hostW = std::max(560, static_cast<int>(client.right) - hostX - 24);
-	const int hostH = std::max(320, static_cast<int>(client.bottom) - hostY - 24);
-	if (teacherHostWindow) {
-		MoveWindow(teacherHostWindow, hostX, hostY, hostW, hostH, TRUE);
-		// 只在真正嵌入原教师端窗口时才显示宿主框。没有嵌入时它是一个空的
-		// WS_EX_CLIENTEDGE STATIC，会盖住 PaintNetwork 画好的圆角卡片。
-		const bool hostVisible = visible && teacherChildWindow != nullptr && IsWindow(teacherChildWindow);
-		ShowWindow(teacherHostWindow, hostVisible ? SW_SHOW : SW_HIDE);
-	}
-	MoveWindow(teacherLaunchButton, hostX, 120, 144, 34, TRUE);
-	ShowWindow(teacherLaunchButton, visible ? SW_SHOW : SW_HIDE);
-	for (HWND control : { teacherRefreshButton, teacherViewButton, teacherStudentList, teacherChatInput, teacherChatButton,
-		teacherBlackButton, teacherUnlockButton, teacherShutdownButton, teacherRebootButton })
-		if (control) ShowWindow(control, SW_HIDE);
-	LayoutEmbeddedTeacherGui();
-	return;
-	}
-	RECT client{};
-	GetClientRect(_hWnd, &client);
+	// 布局常量都是 96 DPI 的逻辑值；原生控件要按 dpiScale 换算成物理像素，
+	// 否则 150% 缩放下控件会飘到自绘卡片的左上角。
+	const int logicalWidth = static_cast<int>(client.right / (dpiScale > 0 ? dpiScale : 1.0));
+	const int logicalHeight = static_cast<int>(client.bottom / (dpiScale > 0 ? dpiScale : 1.0));
 	const bool visible = page == Page::Network;
 	const int left = 280;
 	const int top = 184;
-	const int right = std::max(left + 520, static_cast<int>(client.right) - 28);
+	const int right = std::max(left + 520, logicalWidth - 28);
 	const int listRight = left + std::min(520, std::max(420, (right - left) * 46 / 100));
-	const int listBottom = std::max(top + 240, static_cast<int>(client.bottom) - 36);
-	auto show = [visible](HWND window, int x, int y, int w, int h) {
+	const int listBottom = std::max(top + 240, logicalHeight - 36);
+	auto show = [this, visible](HWND window, int x, int y, int width, int height) {
 		if (!window) return;
-		MoveWindow(window, x, y, w, h, TRUE);
+		MoveWindow(window, Scale(x), Scale(y), Scale(width), Scale(height), TRUE);
 		ShowWindow(window, visible ? SW_SHOW : SW_HIDE);
 	};
+
+	// 内置控制台模式下宿主框要给控制台留位置；FLTK 版嵌入时则由
+	// LayoutEmbeddedTeacherGui 按真实客户区铺满。
+	if (teacherHostWindow) {
+		const int hostX = 264, hostY = 170;
+		const int hostW = std::max(560, logicalWidth - hostX - 24);
+		const int hostH = std::max(320, logicalHeight - hostY - 24);
+		MoveWindow(teacherHostWindow, Scale(hostX), Scale(hostY), Scale(hostW), Scale(hostH), TRUE);
+		const bool hostVisible = visible &&
+			((teacherChildWindow != nullptr && IsWindow(teacherChildWindow)) || teacherConsoleMode);
+		ShowWindow(teacherHostWindow, hostVisible ? SW_SHOW : SW_HIDE);
+	}
+
 	show(teacherLaunchButton, left, 120, 170, 34);
 	show(teacherRefreshButton, left + 182, 120, 120, 34);
 	show(teacherViewButton, left + 314, 120, 120, 34);
@@ -8580,9 +8593,13 @@ void MainWindow::LayoutTeacherControls()
 	show(teacherUnlockButton, actionLeft + 138, top + 106, 100, 36);
 	show(teacherShutdownButton, actionLeft, top + 162, 100, 36);
 	show(teacherRebootButton, actionLeft + 112, top + 162, 100, 36);
+
 	const auto viewState = teacherBackend && teacherBackend->running && !teacherBackend->selected_ip.empty()
 		? teacherBackend->service.remoteViewState(teacherBackend->selected_ip) : jiyu::RemoteViewState{};
 	if (teacherViewButton) SetWindowTextW(teacherViewButton, viewState.active ? L"\u505c\u6b62\u753b\u9762" : L"\u5b9e\u65f6\u753b\u9762");
+
+	if (teacherConsoleMode) LayoutTeacherConsole();
+	else LayoutEmbeddedTeacherGui();
 }
 
 static std::wstring teacherUtf8ToWide(const std::string& text)
@@ -8875,7 +8892,6 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 
 void MainWindow::StopEmbeddedTeacherGui()
 {
-	CloseTeacherConsole();
 	if (teacherChildWindow && IsWindow(teacherChildWindow)) PostMessageW(teacherChildWindow, WM_CLOSE, 0, 0);
 	if (teacherProcess) {
 		if (WaitForSingleObject(teacherProcess, 1200) == WAIT_TIMEOUT)
@@ -8883,6 +8899,9 @@ void MainWindow::StopEmbeddedTeacherGui()
 		WaitForSingleObject(teacherProcess, 1000);
 		CloseHandle(teacherProcess);
 	}
+	// 进程先退出，读线程才会从 ReadFile 结束；顺序反了会把管道句柄
+	// 在别人还读着的时候关掉。
+	CloseTeacherConsole();
 	teacherProcess = nullptr;
 	teacherProcessId = 0;
 	teacherChildWindow = nullptr;
@@ -8901,6 +8920,9 @@ void MainWindow::PollEmbeddedTeacherGui()
 		teacherProcess = nullptr;
 		teacherProcessId = 0;
 		teacherChildWindow = nullptr;
+		// 教师端自己退出时也要收掉管道与读线程，否则下次启动会覆盖
+		// 句柄，旧线程还会继续往新控制台里灌输出。
+		CloseTeacherConsole();
 		teacherLaunchPending = false;
 		teacherLaunchDeadline = 0;
 		if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u542f\u52a8\u6559\u5e08\u7aef");

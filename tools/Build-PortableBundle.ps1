@@ -35,8 +35,12 @@ $SourceExe = [IO.Path]::GetFullPath($SourceExe)
 if ((Test-Path -LiteralPath $OutputDir) -and -not $KeepExisting) {
     # Only ever remove the directory this script owns; refuse anything wider.
     $resolved = [IO.Path]::GetFullPath($OutputDir)
-    if ($resolved -eq $root -or $resolved -eq [IO.Path]::GetPathRoot($resolved)) {
-        throw "Refusing to clean a dangerous output directory: $resolved"
+    # 只允许清理由本脚本产出的目录：必须在仓库的 dist/ 下，且不能是 dist 本身。
+    $distRoot = [IO.Path]::GetFullPath((Join-Path $root 'dist'))
+    $underDist = $resolved.StartsWith($distRoot + [IO.Path]::DirectorySeparatorChar) -and
+        ($resolved.TrimEnd([IO.Path]::DirectorySeparatorChar) -ne $distRoot.TrimEnd([IO.Path]::DirectorySeparatorChar))
+    if (-not $underDist) {
+        throw "Refusing to clean a directory outside dist/: $resolved"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }
@@ -127,7 +131,10 @@ if (-not (Test-Path -LiteralPath $iniPath)) {
         'AllowMonitor=TRUE',
         'EnforceMode=record'
     )
-    Set-Content -LiteralPath $iniPath -Value $ini -Encoding UTF8
+    # GetPrivateProfileString 按 ANSI 解析 ini，UTF-8 BOM 会让第一段变成
+    # "﻿[JTArgeement]"，程序读不到 FirstUse/Argeed。写成无 BOM。
+    [IO.File]::WriteAllText($iniPath, ($ini -join [Environment]::NewLine) + [Environment]::NewLine,
+        (New-Object System.Text.UTF8Encoding($false)))
 }
 
 # --- Read me ----------------------------------------------------------------

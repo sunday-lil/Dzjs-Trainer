@@ -42,9 +42,10 @@ if (Test-Path -LiteralPath $unlockTokenMaterial) {
     if (-not (Test-Path -LiteralPath $protectScript)) {
         throw "Missing unload-token protection script: $protectScript"
     }
+    # 第二次运行时输出已存在：不带 -Force 会被保护脚本拒绝，整条签名流程中断。
     & powershell -ExecutionPolicy Bypass -File $protectScript `
         -InputPath $unlockTokenMaterial `
-        -OutputPath $unlockTokenDestination
+        -OutputPath $unlockTokenDestination -Force
     if ($LASTEXITCODE -ne 0) {
         throw "Unload-token encryption failed with exit code $LASTEXITCODE"
     }

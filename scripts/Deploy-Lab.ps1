@@ -53,8 +53,10 @@ Write-Host "已复制 $((Get-ChildItem -LiteralPath $TargetDir -Recurse -File).C
 # --- ini ---------------------------------------------------------------------
 $iniPath = Join-Path $TargetDir 'DzjsTrainer.ini'
 if (-not (Test-Path -LiteralPath $iniPath)) {
-    @('[JTArgeement]', 'FirstUse=TRUE', 'Argeed=FALSE', '', '[JTSettings]', 'CaptureExclusion=1') |
-        Set-Content -LiteralPath $iniPath -Encoding UTF8
+    # 与打包脚本一致：ini 用无 BOM UTF-8，GetPrivateProfileString 才能读到第一段。
+    [IO.File]::WriteAllText($iniPath,
+        "[JTArgeement]`r`nFirstUse=TRUE`r`nArgeed=FALSE`r`n`r`n[JTSettings]`r`nCaptureExclusion=1`r`n",
+        (New-Object System.Text.UTF8Encoding($false)))
 }
 
 if (-not ('IniWriter' -as [type])) {
@@ -105,7 +107,13 @@ if ($EnableTestSigning) {
         Write-Host "Secure Boot 已开启：bcdedit 会被固件拒绝。请先进入 BIOS 关闭 Secure Boot，再运行本选项。" -ForegroundColor Yellow
     } else {
         & bcdedit /set testsigning on | Out-Host
-        Write-Host "已设置 testsigning=on，需要重启生效。" -ForegroundColor Yellow
+        if ($LASTEXITCODE -ne 0) {
+            # $ErrorActionPreference 不管原生程序退出码，以前会照样打印"已设置"。
+            Write-Host "bcdedit 失败（exit $LASTEXITCODE）：请确认以管理员运行，且固件没有锁定该启动项。" -ForegroundColor Red
+        }
+        else {
+            Write-Host "已设置 testsigning=on，需要重启生效。" -ForegroundColor Yellow
+        }
         Write-Host "还原卡机器请务必在母盘上执行并重建还原点，否则重启后会被还原。" -ForegroundColor Yellow
     }
 }

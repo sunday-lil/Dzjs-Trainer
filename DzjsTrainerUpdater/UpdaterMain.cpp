@@ -702,10 +702,19 @@ bool FetchManifest(Manifest& manifest)
 // 说明里的换行转义成 \n，保证一行一个字段，解析端不用处理多行。
 static bool WriteManifestFile(const std::wstring& path, const Manifest& manifest)
 {
+	auto oneLine = [](const std::string& value) {
+		std::string out;
+		for (char ch : value) {
+			if (ch == '\r') continue;
+			if (ch == '\n') out += "\\n";
+			else out.push_back(ch);
+		}
+		return out;
+	};
 	std::string text;
-	text += "version=" + manifest.version + "\n";
-	text += "sha256=" + manifest.sha256 + "\n";
-	text += "url=" + manifest.url + "\n";
+	text += "version=" + oneLine(manifest.version) + "\n";
+	text += "sha256=" + oneLine(manifest.sha256) + "\n";
+	text += "url=" + oneLine(manifest.url) + "\n";
 	text += "notes=";
 	for (char ch : manifest.notes) {
 		if (ch == '\r') continue;

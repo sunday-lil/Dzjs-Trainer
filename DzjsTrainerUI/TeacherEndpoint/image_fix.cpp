@@ -107,6 +107,15 @@ bool saveFixedPreviewJpeg(const std::filesystem::path& raw_path, const std::file
         setError(error_message, "raw JPEG has empty dimensions");
         return false;
     }
+    // 逐像素 GetPixel/SetPixel：一张几 MB 的 JPEG 可以解出上亿像素，
+    // 不设上限会把 io_context 线程锁死，教师端整体停摆。
+    constexpr UINT kMaxSide = 8192;
+    constexpr unsigned long long kMaxPixels = 40ull * 1000ull * 1000ull;
+    if (width > kMaxSide || height > kMaxSide ||
+        static_cast<unsigned long long>(width) * height > kMaxPixels) {
+        setError(error_message, "raw JPEG dimensions exceed the safe limit");
+        return false;
+    }
 
     Gdiplus::Bitmap fixed(width, height, PixelFormat24bppRGB);
     if (fixed.GetLastStatus() != Gdiplus::Ok) {

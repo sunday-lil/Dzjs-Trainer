@@ -340,6 +340,12 @@ static bool HttpGetWOnce(const std::wstring& url, std::string& body, std::string
 					ok = false;
 					break;
 				}
+				// 清单只有几百字节；这里跑在提权进程里，必须给个上限，
+				// 否则被劫持的端点可以用无限响应把内存吃光。
+				if (body.size() + read > (4u << 20)) {
+					ok = false;
+					break;
+				}
 				body.append(buffer, read);
 			}
 			if (!ok) LogTrace(L"更新探测：读取响应体失败 err=%lu", GetLastError());

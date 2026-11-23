@@ -11,6 +11,29 @@ namespace {
 constexpr UINT kTeacherConsoleOutputMessage = WM_APP + 71;
 constexpr int kTeacherConsoleSendId = 0x7C01;
 HWND g_consoleOwner = nullptr;
+WNDPROC g_hostOldProc = nullptr;
+WNDPROC g_inputOldProc = nullptr;
+
+LRESULT CALLBACK TeacherHostProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	// 宿主是 STATIC，BN_CLICKED 只会发给它自己；转给主窗口处理。
+	if (message == WM_COMMAND && LOWORD(wParam) == kTeacherConsoleSendId) {
+		if (g_consoleOwner) PostMessageW(g_consoleOwner, WM_COMMAND, wParam, lParam);
+		return 0;
+	}
+	return CallWindowProcW(g_hostOldProc, hwnd, message, wParam, lParam);
+}
+
+LRESULT CALLBACK TeacherInputProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	// 输入框里按回车等同于点"发送"。
+	if (message == WM_KEYDOWN && wParam == VK_RETURN) {
+		if (g_consoleOwner) PostMessageW(g_consoleOwner, WM_COMMAND,
+			static_cast<WPARAM>(kTeacherConsoleSendId), 0);
+		return 0;
+	}
+	return CallWindowProcW(g_inputOldProc, hwnd, message, wParam, lParam);
+}
 
 DWORD WINAPI TeacherConsoleReaderThread(LPVOID parameter)
 {
@@ -35,8 +58,11 @@ DWORD WINAPI TeacherConsoleReaderThread(LPVOID parameter)
 				MultiByteToWideChar(codePage, 0, line.c_str(), static_cast<int>(line.size()), wide.data(), wideLength);
 			}
 			if (!wide.empty() && g_consoleOwner) {
-				PostMessageW(g_consoleOwner, kTeacherConsoleOutputMessage, 0,
-					reinterpret_cast<LPARAM>(new std::wstring(wide)));
+				auto* payload = new std::wstring(wide);
+				if (!PostMessageW(g_consoleOwner, kTeacherConsoleOutputMessage, 0,
+					reinterpret_cast<LPARAM>(payload))) {
+					delete payload;   // 窗口没了或队列满：不留无主堆对象
+				}
 			}
 		}
 	}
@@ -125,6 +151,14 @@ void MainWindow::EnsureTeacherConsole()
 			reinterpret_cast<HMENU>(static_cast<INT_PTR>(kTeacherConsoleSendId)),
 			JTAppGetInstanceDirect(), nullptr);
 	}
+	if (teacherHostWindow && !g_hostOldProc) {
+		g_hostOldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(teacherHostWindow,
+			GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TeacherHostProc)));
+	}
+	if (teacherConsoleInput && !g_inputOldProc) {
+		g_inputOldProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(teacherConsoleInput,
+			GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(TeacherInputProc)));
+	}
 	LayoutTeacherConsole();
 }
 
@@ -171,13 +205,15 @@ void MainWindow::SendTeacherConsoleCommand()
 
 void MainWindow::CloseTeacherConsole()
 {
+	// stdin 先关：子进程读到 EOF 会退出，读线程随之中断 ReadFile，
+	// 这时再关读端和线程句柄才是安全的（反过来会让线程读已关闭/复用的句柄）。
 	if (teacherStdin) { CloseHandle(teacherStdin); teacherStdin = nullptr; }
-	if (teacherStdout) { CloseHandle(teacherStdout); teacherStdout = nullptr; }
 	if (teacherReader) {
-		WaitForSingleObject(teacherReader, 500);
+		WaitForSingleObject(teacherReader, 3000);
 		CloseHandle(teacherReader);
 		teacherReader = nullptr;
 	}
+	if (teacherStdout) { CloseHandle(teacherStdout); teacherStdout = nullptr; }
 	if (teacherConsoleLog) { DestroyWindow(teacherConsoleLog); teacherConsoleLog = nullptr; }
 	if (teacherConsoleInput) { DestroyWindow(teacherConsoleInput); teacherConsoleInput = nullptr; }
 	if (teacherConsoleSend) { DestroyWindow(teacherConsoleSend); teacherConsoleSend = nullptr; }

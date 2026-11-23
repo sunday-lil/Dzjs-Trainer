@@ -483,9 +483,13 @@ BOOL JUpdater_ApplyPackageInPlace(LPCWSTR packagePath, LPCWSTR sha256Hex,
 		FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr, directory.c_str(), &startup, &process);
 	if (!started) {
 		const DWORD code = GetLastError();
-		// 回滚：删掉刚搬进来的新文件，把 .old 改回原名，用户还能继续用旧版本。
-		const BOOL reverted = DeleteFileW(exePath.c_str()) &&
-			MoveFileExW(backupPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+		// 回滚：优先直接 MOVEFILE_REPLACE_EXISTING 覆盖；只有它失败才先删后改名。
+		// 原来用 && 连接，DeleteFile 一旦被杀软占用失败就永远走不到还原分支。
+		BOOL reverted = MoveFileExW(backupPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+		if (!reverted) {
+			DeleteFileW(exePath.c_str());
+			reverted = MoveFileExW(backupPath.c_str(), exePath.c_str(), MOVEFILE_REPLACE_EXISTING);
+		}
 		if (reverted) {
 			SetError(errorText, errorChars,
 				L"新版本无法启动，已回滚到原版本，错误码 " + std::to_wstring(code));
@@ -514,6 +518,17 @@ void JUpdater_CleanupOldImages()
 	std::vector<std::wstring> victims;
 	do {
 		if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+			// 刚回滚/刚换下来的 .old 可能是唯一可用副本，10 分钟内不动它。
+			const ULONGLONG written = (static_cast<ULONGLONG>(data.ftLastWriteTime.dwHighDateTime) << 32) |
+				data.ftLastWriteTime.dwLowDateTime;
+			FILETIME nowFile{};
+			GetSystemTimeAsFileTime(&nowFile);
+			const ULONGLONG nowFileTicks = (static_cast<ULONGLONG>(nowFile.dwHighDateTime) << 32) |
+				nowFile.dwLowDateTime;
+			if (written != 0 && nowFileTicks > written &&
+				(nowFileTicks - written) < 600ULL * 10000000ULL) {
+				continue;
+			}
 			victims.push_back(exePath.substr(0, slash + 1) + data.cFileName);
 		}
 	} while (FindNextFileW(find, &data));
