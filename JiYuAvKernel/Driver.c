@@ -352,6 +352,19 @@ JiYuAvDriverUnload(
     UNREFERENCED_PARAMETER(DriverObject);
 }
 
+static NTSTATUS
+JiYuAvDispatchUnsupported(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp
+    )
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+    Irp->IoStatus.Information = 0UL;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_INVALID_DEVICE_REQUEST;
+}
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT DriverObject,
@@ -372,6 +385,14 @@ DriverEntry(
     AvSignatureStoreInitialize();
     AvScannerInitialize();
 
+    // 其余 IRP 必须显式兜底：MajorFunction[] 为 NULL 时 I/O 管理器
+    // 会直接 call NULL（ReadFile/WriteFile/CloseHandle 都能触发）。
+    {
+        ULONG index;
+        for (index = 0; index <= IRP_MJ_MAXIMUM_FUNCTION; ++index) {
+            DriverObject->MajorFunction[index] = JiYuAvDispatchUnsupported;
+        }
+    }
     DriverObject->MajorFunction[IRP_MJ_CREATE] = JiYuAvDispatchCreate;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = JiYuAvDispatchClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = JiYuAvDispatchDeviceControl;

@@ -183,7 +183,10 @@ BOOL VInjectHookIntoProcess(HANDLE process)
 	VDebugLog(L"capture-helper load result=%d wait=%lu module=%p error=%lu", result, waitResult,
 		reinterpret_cast<HMODULE>(static_cast<ULONG_PTR>(remoteModule)), result ? ERROR_SUCCESS : GetLastError());
 	CloseHandle(remoteThread);
-	VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
+	// 超时后远程线程可能仍在 LoadLibraryW 里读这块路径，释放会造成
+	// 目标进程 use-after-free；只有线程确实结束才回收。
+	if (waitResult == WAIT_OBJECT_0)
+		VirtualFreeEx(process, remotePath, 0, MEM_RELEASE);
 	return result;
 }
 

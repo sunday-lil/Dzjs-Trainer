@@ -100,16 +100,23 @@ JdrvHeartbeat(
         return STATUS_INVALID_PARAMETER;
     }
 
-    RtlZeroMemory(Response, sizeof(*Response));
-    Response->size = sizeof(*Response);
-    Response->version = JDRV_PROTOCOL_VERSION;
-    Response->processId = callerProcessId;
-    Response->protocolVersion = JDRV_PROTOCOL_VERSION;
-    Response->sequence = Request->sequence;
-    if (Request->version != JDRV_PROTOCOL_VERSION) {
-        Response->accepted = 0UL;
-        *Information = sizeof(*Response);
-        return STATUS_REVISION_MISMATCH;
+    // METHOD_BUFFERED 下 Request 和 Response 是同一块系统缓冲：
+    // 先 RtlZeroMemory(Response) 会把 Request->version/sequence 一起清零，
+    // 于是 version 校验永远失败、心跳永远被拒。先取出请求字段再清零。
+    {
+        const ULONG requestVersion = Request->version;
+        const ULONG64 requestSequence = Request->sequence;
+        RtlZeroMemory(Response, sizeof(*Response));
+        Response->size = sizeof(*Response);
+        Response->version = JDRV_PROTOCOL_VERSION;
+        Response->processId = callerProcessId;
+        Response->protocolVersion = JDRV_PROTOCOL_VERSION;
+        Response->sequence = requestSequence;
+        if (requestVersion != JDRV_PROTOCOL_VERSION) {
+            Response->accepted = 0UL;
+            *Information = sizeof(*Response);
+            return STATUS_REVISION_MISMATCH;
+        }
     }
 
     interruptTime = KeQueryInterruptTime();
@@ -125,8 +132,8 @@ JdrvHeartbeat(
         return STATUS_DEVICE_BUSY;
     }
     g_JdrvHeartbeatProcessId = callerProcessId;
-    g_JdrvHeartbeatProtocolVersion = Request->version;
-    g_JdrvHeartbeatSequence = Request->sequence;
+    g_JdrvHeartbeatProtocolVersion = Response->version;
+    g_JdrvHeartbeatSequence = Response->sequence;
     g_JdrvHeartbeatTime = interruptTime;
     KeReleaseSpinLock(&g_JdrvHeartbeatLock, oldIrql);
     Response->accepted = 1UL;

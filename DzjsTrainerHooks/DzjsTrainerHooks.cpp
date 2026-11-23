@@ -141,6 +141,8 @@ DWORD uiThreadId = 0;
 DWORD initializeThreadId = 0;
 const UINT WM_HOOK_INITIALIZED = WM_APP + 1;
 const UINT WM_STATUS_APPEND = WM_APP + 2;
+// 指针消息的握手值：只有本模块知道，外部进程无法伪造出可被 delete[] 的地址。
+const WPARAM WM_STATUS_APPEND_MAGIC = 0x445A5321u;
 DWORD WINAPI VHookInitializeThread(LPVOID lpThreadParameter);
 DWORD WINAPI VWatchdogThread(LPVOID lpThreadParameter);
 DWORD WINAPI VSendMessageBackThread(LPVOID lpThreadParameter);
@@ -1129,7 +1131,8 @@ void VOutPutStatus(const wchar_t* str, ...) {
 	if (!status)
 		return;
 	wcscpy_s(status, out.length() + 1, out.c_str());
-	if (!PostMessageW(hWndMsgCenter, WM_STATUS_APPEND, 0, reinterpret_cast<LPARAM>(status)))
+	if (!PostMessageW(hWndMsgCenter, WM_STATUS_APPEND, WM_STATUS_APPEND_MAGIC,
+		reinterpret_cast<LPARAM>(status)))
 		delete[] status;
 }
 bool VWindowTextIsGb(const wchar_t* text) {
@@ -2806,7 +2809,13 @@ void VUnInstallHooks() {
 	g_frames.Shutdown();
 	if (g_VideoCsInit) { DeleteCriticalSection(&g_VideoCs); g_VideoCsInit = false; }
 	// 释放全部 trampoline。必须放在上面所有仍可能调进钩子的清理动作之后。
-	HookEngine::Uninitialize();
+	// 有 detour 没归零时绝不能释放：那些线程返回后会跳到已释放的 trampoline。
+	if (!drained) {
+		VOutPutStatus(L"[E] detours still in flight; trampolines intentionally leaked");
+	}
+	else {
+		HookEngine::Uninitialize();
+	}
 
 	VOutPutStatus(L"[D] UnInstall all hook");
 
@@ -3230,11 +3239,16 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		break;
 	}
 	case WM_STATUS_APPEND: {
+		// 指针是本进程堆上的对象：只接受带握手值、且来自本进程的消息，
+		// 否则外部进程 SendMessage 一个地址过来就会被 delete[] 掉。
+		DWORD senderPid = 0;
+		GetWindowThreadProcessId(hDlg, &senderPid);
 		wchar_t* status = reinterpret_cast<wchar_t*>(lParam);
-		VDebugLog(L"WM_STATUS_APPEND begin text=%s", status ? status : L"(null)");
-		if (status)
+		if (wParam == WM_STATUS_APPEND_MAGIC && senderPid == GetCurrentProcessId() && status) {
+			VDebugLog(L"WM_STATUS_APPEND begin text=%s", status);
 			VAppendStatusLine(status);
-		delete[] status;
+			delete[] status;
+		}
 		VDebugLog(L"WM_STATUS_APPEND end");
 		return TRUE;
 	}
