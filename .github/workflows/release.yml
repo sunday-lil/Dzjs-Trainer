@@ -13,6 +13,10 @@ on:
         description: "产物版本号（仅用于文件名）"
         required: false
         default: "dev"
+      build_ref:
+        description: "要验证的 ref（分支/标签），默认 main"
+        required: false
+        default: "main"
       make_zip:
         description: "是否额外生成便携包 zip"
         type: boolean
@@ -27,6 +31,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.build_ref }}
 
       - name: 准备 MSBuild
         uses: microsoft/setup-msbuild@v2
