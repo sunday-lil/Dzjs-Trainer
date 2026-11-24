@@ -47,3 +47,19 @@ python tools\verify_repo.py --strict
 - `tools/Complete-DriverSigning.ps1`、`tools/Build-DzjsTrainerRelease.ps1`、`tools/New-DriverUnlock*.ps1`
 - `DzjsTrainer/DriverSignerPin.h`、`DzjsTrainerDriver/UnlockPublicKey.h`
 - `update-server/` 的票据密钥相关脚本
+
+## 提交前必须做到的四件事（2026-11 补充）
+
+这些是上一轮提交被退回后总结的，按顺序执行：
+
+1. **先在干净 clone 上复现**：`git clone` 一份新仓库、按 `docs/BUILD.md` 从零构建，确认问题在原始代码里存在。
+   本机改过工具集、换过 SDK、手工签过名的产物不能作为"发布版的问题"的证据。
+2. **一个 PR 只做一件事**：能用一个文件、十几行说清的修复，就不要附带目录整理或构建改动。
+   改动越大，review 成本越高，被整体退回的概率也越大。
+3. **不要自行改变发布形态**：内嵌资源、发布包结构、签名链、更新链的写入位置都属于设计决定，
+   有疑问先开 issue 问，不要用"这样更方便"为理由直接改。
+4. **写清验证方式**：贴出复现步骤、修复前后行为对比、以及在干净环境跑过的构建/测试命令。
+   CI 绿了不等于问题修好了，但 CI 红了一定说明没修好。
+
+另外：不要为了绕开本机缺组件而改工程文件（例如把工具集从 v143 自动回退到 v145）。
+需要别的工具集就显式传属性，并在 PR 说明里写清楚。
