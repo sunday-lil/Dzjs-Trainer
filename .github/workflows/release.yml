@@ -64,7 +64,7 @@ jobs:
         if: ${{ hashFiles('scripts/build-driver-wdk.cmd') == '' }}
         shell: cmd
         run: |
-          msbuild DzjsTrainer.sln /p:Configuration=Release /p:Platform=Win32 /m /v:minimal
+          msbuild DzjsTrainer.sln /p:Configuration=Release /m /v:minimal
           if errorlevel 1 exit /b 1
           msbuild DzjsTrainer.sln /p:Configuration=Release /p:Platform=x64 /p:SkipInvalidConfigurations=true /m /v:minimal
 
