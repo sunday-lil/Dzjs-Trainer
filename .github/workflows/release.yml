@@ -56,14 +56,25 @@ jobs:
           "BOOST_ROOT=$(Join-Path $env:RUNNER_TEMP 'boost\boost_1_86_0')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: 编译驱动
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') != '' }}
         shell: cmd
         run: scripts\build-driver-wdk.cmd
 
+      - name: 编译（上游布局，用解决方案）
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') == '' }}
+        shell: cmd
+        run: |
+          msbuild DzjsTrainer.sln /p:Configuration=Release /p:Platform=Win32 /m /v:minimal
+          if errorlevel 1 exit /b 1
+          msbuild DzjsTrainer.sln /p:Configuration=Release /p:Platform=x64 /p:SkipInvalidConfigurations=true /m /v:minimal
+
       - name: 编译 AV 驱动
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') != '' }}
         shell: cmd
         run: scripts\build-av-driver-wdk.cmd
 
       - name: 编译 Hook（x86 / x64）
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') != '' }}
         shell: cmd
         run: |
           msbuild DzjsTrainerHooks\DzjsTrainerHooks.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:OutDir="%CD%\Release\\" /m /v:minimal
@@ -71,6 +82,7 @@ jobs:
           msbuild DzjsTrainerHooks\DzjsTrainerHooks.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%CD%\x64\Release\\" /m /v:minimal
 
       - name: 编译更新器
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') != '' }}
         shell: cmd
         run: |
           msbuild DzjsTrainerUpdater\DzjsTrainerUpdater.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:OutDir="%CD%\Release\\" /m /v:minimal
@@ -78,6 +90,7 @@ jobs:
           msbuild DzjsTrainerUpdater\DzjsTrainerUpdaterExe.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:OutDir="%CD%\Release\\" /m /v:minimal
 
       - name: 编译 64 位注入助手
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') != '' }}
         shell: cmd
         run: |
           if not exist x64\Release mkdir x64\Release
@@ -93,6 +106,7 @@ jobs:
           cl /nologo /O2 /EHsc /MD /DUNICODE /D_UNICODE DzjsTrainerInjector64\DzjsTrainerInjector64.cpp /Fe:x64\Release\DzjsTrainerInjector64.exe /Fo:x64\Release\DzjsTrainerInjector64.obj
 
       - name: 编译 UI 与主程序
+        if: ${{ hashFiles('scripts/build-driver-wdk.cmd') != '' }}
         shell: cmd
         run: |
           msbuild DzjsTrainerUI\DzjsTrainerUI.vcxproj /p:Configuration=Release /p:Platform=Win32 /p:BoostIncludeDir="%BOOST_ROOT%" /p:OutDir="%CD%\Release\\" /m /v:minimal
