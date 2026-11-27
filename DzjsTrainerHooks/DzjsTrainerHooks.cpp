@@ -18,7 +18,7 @@
 // 电子教室产品识别表与主程序共用一份（DzjsTrainer/EduProducts.h）：
 // 主程序用它决定往哪个进程注入，这里用同一张表判断注入进来的宿主是不是
 // 「已知电子教室」，两边分开维护迟早会对不上。
-#include "EduProducts.h"
+#include "../DzjsTrainer/EduProducts.h"
 #include <list>
 #include <string>
 #include <vector>

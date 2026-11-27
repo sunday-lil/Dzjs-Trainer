@@ -81,3 +81,6 @@ unlock-key-material/
 /Release-v*/
 /mtest.txt
 /.workbuddy/
+
+# 本地产物
+dist/

@@ -74,7 +74,7 @@ ARTIFACT_SUFFIXES = {
 
 ROOT_ALLOWLIST = {
     ".editorconfig", ".gitattributes", ".gitignore", ".github",
-    "CHANGELOG.md", "CONTRIBUTING.md", "LICENSE", "README.md",
+    "CHANGELOG.md", "CONTRIBUTING.md", "DEVELOPMENT.md", "LICENSE", "README.md",
     "DzjsTrainer.sln", "JiYuAv.sln",
     "assets", "docs", "include", "resources", "scripts", "third_party",
     "DzjsTrainer", "DzjsTrainerUI", "DzjsTrainerDriver", "DzjsTrainerHooks",
