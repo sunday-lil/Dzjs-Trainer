@@ -13,42 +13,78 @@ BOOL WINAPI hkSetForegroundWindow(HWND hWnd)
 
 BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags)
 {
+	// 全屏 = 铺满整屏；置顶 = 插到 HWND_TOPMOST。两者同时出现时问一次。
+	const bool fullRequest = ((uFlags & SWP_NOSIZE) == 0 &&
+		x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) ||
+		((uFlags & SWP_NOSIZE) == 0 && VEduFullScreenRequest(hWnd, x, y, cx, cy));
+	const bool topRequest = hWndInsertAfter == HWND_TOPMOST;
+
 	// 只记录：没打开「拦截远程窗口操作」时原样放行，只在日志里留一条。
 	if (!(loaded && blockWindowOps)) {
 		VRecordHook(L"SetWindowPos", L"hwnd=%p x=%d y=%d cx=%d cy=%d flags=0x%X", hWnd, x, y, cx, cy, uFlags);
+		// 询问不受这个总开关约束：它不改变最终结果，只是先问一句。
+		if (fullRequest || topRequest) {
+			WindowOpRequest req = {};
+			req.source = VOP_SRC_SETWINDOWPOS;
+			req.hwnd = hWnd;
+			req.insertAfter = hWndInsertAfter;
+			req.x = x; req.y = y; req.cx = cx; req.cy = cy;
+			req.flags = uFlags;
+			req.wide = true;
+			if (!VAllowWindowOp(req, fullRequest, topRequest))
+				return TRUE;
+		}
 		return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 	}
 	VTraceHook(L"hkSetWindowPos");
 	if (loaded)
 	{
-		if ((uFlags & SWP_NOSIZE) == 0)
+		if (fullRequest)
 		{
-			if ((x == 0 && y == 0 && cx == screenWidth && cy == screenHeight))
+			VSwitchLockState(hWnd, TRUE);
+			if ((fakeFull) && VIsWindowGbOrHp(hWnd))
+				return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
+			if (VIsInIllegalCanSizeWindows(hWnd))
 			{
-				VSwitchLockState(hWnd, TRUE);
-				if ((fakeFull) && VIsWindowGbOrHp(hWnd))
-					return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
-				if (VIsInIllegalCanSizeWindows(hWnd))
-				{
-					{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
-					raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags | SWP_NOZORDER);
-					// 同步 SendMessage：目标窗口线程若不处理消息，这里会一直等下去。
-					// 日志打在它前后，卡死时最后一行就能指出是不是这里。
-					if (g_hookTrace) VDebugLog(L"hkSetWindowPos SendMessage(WM_SIZE) hwnd=%p before", hWnd);
-					SendMessage(hWnd, WM_SIZE, NULL, NULL);
-					if (g_hookTrace) VDebugLog(L"hkSetWindowPos SendMessage(WM_SIZE) hwnd=%p after", hWnd);
-					return TRUE;
-				}
+				{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
+				raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags | SWP_NOZORDER);
+				// 同步 SendMessage：目标窗口线程若不处理消息，这里会一直等下去。
+				// 日志打在它前后，卡死时最后一行就能指出是不是这里。
+				if (g_hookTrace) VDebugLog(L"hkSetWindowPos SendMessage(WM_SIZE) hwnd=%p before", hWnd);
+				SendMessage(hWnd, WM_SIZE, NULL, NULL);
+				if (g_hookTrace) VDebugLog(L"hkSetWindowPos SendMessage(WM_SIZE) hwnd=%p after", hWnd);
 				return TRUE;
 			}
-			else {
-				VSwitchLockState(hWnd, FALSE);
-				if (fakeFull)
-					return raSetWindowPos(hWnd, HWND_NOTOPMOST, x, y, cx, cy, uFlags);
-			}
+		}
+		else {
+			VSwitchLockState(hWnd, FALSE);
+			if (fakeFull)
+				return raSetWindowPos(hWnd, HWND_NOTOPMOST, x, y, cx, cy, uFlags);
 		}
 
-		if (VIsInIllegalWindows(hWnd)) 
+		WindowOpRequest req = {};
+		req.source = VOP_SRC_SETWINDOWPOS;
+		req.hwnd = hWnd;
+		req.insertAfter = hWndInsertAfter;
+		req.x = x; req.y = y; req.cx = cx; req.cy = cy;
+		req.flags = uFlags;
+		req.wide = true;
+		// 极域看名单；其他适配产品没有名单，按「谁在把自己铺满」认。
+		// 判据在 VWindowOpAskable 里，和只记录那条路径共用一套。
+		const bool askable = (fullRequest || topRequest) &&
+			VWindowOpAskable(hWnd, &req, fullRequest, topRequest);
+		if (VIsInIllegalWindows(hWnd) || askable)
+		{
+			// 以前这里一律吞掉。现在全屏和置顶先问用户：允许就按原参数放行，
+			// 拒绝就继续挡；第一次还没答复时先挡下，等消息中心线程重放。
+			if (fullRequest || topRequest) {
+				if (!VAllowWindowOp(req, fullRequest, topRequest))
+					return TRUE;
+				return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
+			}
+			return TRUE;
+		}
+		if (fullRequest)
 			return TRUE;
 	}
 	return raSetWindowPos(hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
@@ -56,39 +92,71 @@ BOOL WINAPI hkSetWindowPos(HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx
 
 HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, int x, int y, int cx, int cy, UINT uFlags)
 {
+	const bool fullRequest = ((uFlags & SWP_NOSIZE) == 0 &&
+		x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) ||
+		((uFlags & SWP_NOSIZE) == 0 && VEduFullScreenRequest(hWnd, x, y, cx, cy));
+	const bool topRequest = hWndInsertAfter == HWND_TOPMOST;
+
 	if (!(loaded && blockWindowOps)) {
 		VRecordHook(L"DeferWindowPos", L"hwnd=%p x=%d y=%d cx=%d cy=%d flags=0x%X", hWnd, x, y, cx, cy, uFlags);
+		if (fullRequest || topRequest) {
+			WindowOpRequest req = {};
+			// HDWP 只在这一批里有效，重放走 SetWindowPos。
+			req.source = VOP_SRC_SETWINDOWPOS;
+			req.hwnd = hWnd;
+			req.insertAfter = hWndInsertAfter;
+			req.x = x; req.y = y; req.cx = cx; req.cy = cy;
+			req.flags = uFlags;
+			req.wide = true;
+			if (!VAllowWindowOp(req, fullRequest, topRequest))
+				return NULL;
+		}
 		return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
 	}
 	VTraceHook(L"hkDeferWindowPos");
 	if (loaded)
 	{
-		if ((uFlags & SWP_NOSIZE) == 0)
-		{
-			if (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
-				VSwitchLockState(hWnd, TRUE);
-				if (fakeFull && VIsWindowGbOrHp(hWnd))
-					return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
-				if (VIsInIllegalCanSizeWindows(hWnd)) {
-					{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
-					HDWP rs = faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags | SWP_NOZORDER);
-					if (g_hookTrace) VDebugLog(L"hkDeferWindowPos SendMessage(WM_SIZE) hwnd=%p before", hWnd);
-					SendMessage(hWnd, WM_SIZE, NULL, NULL);
-					if (g_hookTrace) VDebugLog(L"hkDeferWindowPos SendMessage(WM_SIZE) hwnd=%p after", hWnd);
-					return rs;
-				}
-				return NULL;
+		if (fullRequest) {
+			VSwitchLockState(hWnd, TRUE);
+			if (fakeFull && VIsWindowGbOrHp(hWnd))
+				return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
+			if (VIsInIllegalCanSizeWindows(hWnd)) {
+				{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
+				HDWP rs = faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags | SWP_NOZORDER);
+				if (g_hookTrace) VDebugLog(L"hkDeferWindowPos SendMessage(WM_SIZE) hwnd=%p before", hWnd);
+				SendMessage(hWnd, WM_SIZE, NULL, NULL);
+				if (g_hookTrace) VDebugLog(L"hkDeferWindowPos SendMessage(WM_SIZE) hwnd=%p after", hWnd);
+				return rs;
 			}
-			else {
-				VSwitchLockState(hWnd, FALSE);
-				if (fakeFull) {
-					return faDeferWindowPos(hWinPosInfo, hWnd, HWND_NOTOPMOST, x, y, cx, cy, uFlags);
-				}
-
+		}
+		else {
+			VSwitchLockState(hWnd, FALSE);
+			if (fakeFull) {
+				return faDeferWindowPos(hWinPosInfo, hWnd, HWND_NOTOPMOST, x, y, cx, cy, uFlags);
 			}
 		}
 
-		if (VIsInIllegalWindows(hWnd))
+		WindowOpRequest req = {};
+		// HDWP 只在这一批里有效，用户隔一会儿才答复时它早被 End 掉了，
+		// 所以重放走 SetWindowPos，语义一样。
+		req.source = VOP_SRC_SETWINDOWPOS;
+		req.hwnd = hWnd;
+		req.insertAfter = hWndInsertAfter;
+		req.x = x; req.y = y; req.cx = cx; req.cy = cy;
+		req.flags = uFlags;
+		req.wide = true;
+		const bool askable = (fullRequest || topRequest) &&
+			VWindowOpAskable(hWnd, &req, fullRequest, topRequest);
+		if (VIsInIllegalWindows(hWnd) || askable)
+		{
+			if (fullRequest || topRequest) {
+				if (!VAllowWindowOp(req, fullRequest, topRequest))
+					return NULL;
+				return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
+			}
+			return NULL;
+		}
+		if (fullRequest)
 			return NULL;
 	}
 	return faDeferWindowPos(hWinPosInfo, hWnd, hWndInsertAfter, x, y, cx, cy, uFlags);
@@ -96,31 +164,58 @@ HDWP WINAPI hkDeferWindowPos(HDWP hWinPosInfo, HWND hWnd, HWND hWndInsertAfter, 
 
 BOOL WINAPI hkMoveWindow(HWND hWnd, int x, int y, int cx, int cy, BOOL bRepaint)
 {
+	const bool fullRequest = (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) ||
+		VEduFullScreenRequest(hWnd, x, y, cx, cy);
+
 	if (!(loaded && blockWindowOps)) {
 		VRecordHook(L"MoveWindow", L"hwnd=%p x=%d y=%d cx=%d cy=%d", hWnd, x, y, cx, cy);
+		if (fullRequest) {
+			WindowOpRequest req = {};
+			req.source = VOP_SRC_MOVEWINDOW;
+			req.hwnd = hWnd;
+			req.x = x; req.y = y; req.cx = cx; req.cy = cy;
+			req.wide = true;
+			if (!VAllowWindowOp(req, true, false))
+				return TRUE;
+		}
 		return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 	}
 	VTraceHook(L"hkMoveWindow");
 	if (loaded)
 	{
-		if (x == 0 && y == 0 && cx == screenWidth && cy == screenHeight) {
+		if (fullRequest) {
 			VSwitchLockState(hWnd, TRUE);
 			if (fakeFull && VIsWindowGbOrHp(hWnd))
 				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 			if (VIsInIllegalCanSizeWindows(hWnd)) {
 				{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
-				return raMoveWindow(hWnd,  x, y, cx, cy, bRepaint);
+				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 			}
-			return TRUE;
 		}
 		else {
 			VSwitchLockState(hWnd, FALSE);
-			if (fakeFull) 
+			if (fakeFull)
 				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 		}
-		if (VIsInIllegalWindows(hWnd))
+
+		WindowOpRequest req = {};
+		req.source = VOP_SRC_MOVEWINDOW;
+		req.hwnd = hWnd;
+		req.x = x; req.y = y; req.cx = cx; req.cy = cy;
+		req.wide = true;
+		const bool askable = fullRequest && VWindowOpAskable(hWnd, &req, true, false);
+		if (VIsInIllegalWindows(hWnd) || askable)
+		{
+			if (fullRequest) {
+				if (!VAllowWindowOp(req, true, false))
+					return TRUE;
+				return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
+			}
 			return TRUE;
-	} 
+		}
+		if (fullRequest)
+			return TRUE;
+	}
 	return raMoveWindow(hWnd, x, y, cx, cy, bRepaint);
 }
 
@@ -143,14 +238,45 @@ LONG WINAPI hkSetWindowLongA(HWND hWnd, int nIndex, LONG dwNewLong)
 {
 	if (!(loaded && blockWindowOps)) {
 		VRecordHook(L"SetWindowLongA", L"hwnd=%p index=%d value=0x%X", hWnd, nIndex, dwNewLong);
+		const bool topRequest = nIndex == GWL_EXSTYLE &&
+			(dwNewLong & WS_EX_TOPMOST) != 0 &&
+			(GetWindowLongA(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
+		if (topRequest) {
+			WindowOpRequest req = {};
+			req.source = VOP_SRC_SETWINDOWLONG;
+			req.hwnd = hWnd;
+			req.index = nIndex;
+			req.value = dwNewLong;
+			req.wide = false;
+			if (!VAllowWindowOp(req, false, true))
+				return GetWindowLongA(hWnd, nIndex);
+		}
 		return faSetWindowLongA(hWnd, nIndex, dwNewLong);
 	}
 	VTraceHook(L"hkSetWindowLongA");
 	if (loaded) {
 		if (fakeFull && VIsWindowGbOrHp(hWnd))
 			return faSetWindowLongA(hWnd, nIndex, dwNewLong);
-		if (VIsInIllegalWindows(hWnd))
+		// 只有「从非置顶变成置顶」才算一次请求。已经在置顶状态时的重复
+		// 写入不改变任何东西，问过一次就不该再弹。
+		const bool topRequest = nIndex == GWL_EXSTYLE &&
+			(dwNewLong & WS_EX_TOPMOST) != 0 &&
+			(GetWindowLongA(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
+		WindowOpRequest req = {};
+		req.source = VOP_SRC_SETWINDOWLONG;
+		req.hwnd = hWnd;
+		req.index = nIndex;
+		req.value = dwNewLong;
+		req.wide = false;
+		const bool askable = topRequest && VWindowOpAskable(hWnd, &req, false, true);
+		if (VIsInIllegalWindows(hWnd) || askable) {
+			if (topRequest) {
+				if (!VAllowWindowOp(req, false, true))
+					return GetWindowLongA(hWnd, nIndex);
+				return faSetWindowLongA(hWnd, nIndex, dwNewLong);
+			}
 			return GetWindowLongA(hWnd, nIndex);
+		}
 	}
 	return faSetWindowLongA(hWnd, nIndex, dwNewLong);
 }
@@ -159,21 +285,96 @@ LONG WINAPI hkSetWindowLongW(HWND hWnd, int nIndex, LONG dwNewLong)
 {
 	if (!(loaded && blockWindowOps)) {
 		VRecordHook(L"SetWindowLongW", L"hwnd=%p index=%d value=0x%X", hWnd, nIndex, dwNewLong);
+		const bool topRequest = nIndex == GWL_EXSTYLE &&
+			(dwNewLong & WS_EX_TOPMOST) != 0 &&
+			(GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
+		if (topRequest) {
+			WindowOpRequest req = {};
+			req.source = VOP_SRC_SETWINDOWLONG;
+			req.hwnd = hWnd;
+			req.index = nIndex;
+			req.value = dwNewLong;
+			req.wide = true;
+			if (!VAllowWindowOp(req, false, true))
+				return GetWindowLongW(hWnd, nIndex);
+		}
 		return faSetWindowLongW(hWnd, nIndex, dwNewLong);
 	}
 	VTraceHook(L"hkSetWindowLongW");
 	if (loaded) {
 		if(fakeFull && VIsWindowGbOrHp(hWnd))
 			return faSetWindowLongW(hWnd, nIndex, dwNewLong);
-		if (VIsInIllegalWindows(hWnd))
+		const bool topRequest = nIndex == GWL_EXSTYLE &&
+			(dwNewLong & WS_EX_TOPMOST) != 0 &&
+			(GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == 0;
+		WindowOpRequest req = {};
+		req.source = VOP_SRC_SETWINDOWLONG;
+		req.hwnd = hWnd;
+		req.index = nIndex;
+		req.value = dwNewLong;
+		req.wide = true;
+		const bool askable = topRequest && VWindowOpAskable(hWnd, &req, false, true);
+		if (VIsInIllegalWindows(hWnd) || askable) {
+			if (topRequest) {
+				if (!VAllowWindowOp(req, false, true))
+					return GetWindowLongW(hWnd, nIndex);
+				return faSetWindowLongW(hWnd, nIndex, dwNewLong);
+			}
 			return GetWindowLongW(hWnd, nIndex);
+		}
 	}
 	return faSetWindowLongW(hWnd, nIndex, dwNewLong);
+}
+
+// 窗口现在铺满所在显示器多少。ShowWindow 带不来目标尺寸，只能看现状。
+static bool VEduWindowCoversMonitorNow(HWND hWnd, int percent)
+{
+	RECT rc;
+	if (!GetWindowRect(hWnd, &rc)) return false;
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return false;
+	const long long monW = (long long)mi.rcMonitor.right - mi.rcMonitor.left;
+	const long long monH = (long long)mi.rcMonitor.bottom - mi.rcMonitor.top;
+	const long long w = (long long)rc.right - rc.left;
+	const long long h = (long long)rc.bottom - rc.top;
+	if (monW <= 0 || monH <= 0 || w <= 0 || h <= 0) return false;
+	return w * h * 100 >= monW * monH * percent;
 }
 
 BOOL WINAPI hkShowWindow(HWND hWnd, int nCmdShow)
 {
 	VTraceHook(L"hkShowWindow");
+	// 第三方宿主的「全屏」有两条常见写法，都没有尺寸参数可看：
+	//   1. ShowWindow(SW_MAXIMIZE) —— Delphi 的 WindowState := wsMaximized、
+	//      MFC 的 ShowWindow(SW_SHOWMAXIMIZED)，伽卡他卡走的就是这条；
+	//   2. CreateWindowEx 直接按整屏建好，再 ShowWindow(SW_SHOW)：窗口从出生
+	//      就是全屏尺寸，中间一次 SetWindowPos 都没有。
+	// 已经最大化的重复调用不问 —— 那只是恢复显示，不是一次新的全屏请求。
+	if (g_customHost && loaded && askWindowOps &&
+		(GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) == 0)
+	{
+		const bool maximize = nCmdShow == SW_MAXIMIZE || nCmdShow == SW_SHOWMAXIMIZED;
+		const bool plainShow = nCmdShow == SW_SHOW || nCmdShow == SW_SHOWNORMAL ||
+			nCmdShow == SW_SHOWDEFAULT || nCmdShow == SW_SHOWNA || nCmdShow == SW_SHOWNOACTIVATE;
+
+		bool full = false;
+		if (maximize)
+			full = (GetWindowLongW(hWnd, GWL_STYLE) & WS_MAXIMIZE) == 0;
+		else if (plainShow)
+			full = VEduWindowCoversMonitorNow(hWnd, 90);
+
+		if (full)
+		{
+			WindowOpRequest req = {};
+			req.source = VOP_SRC_SHOWWINDOW;
+			req.hwnd = hWnd;
+			req.x = nCmdShow;
+			req.wide = true;
+			if (!VAllowWindowOp(req, true, false))
+				return TRUE;
+		}
+	}
 	if (VIsWindowGbOrHp(hWnd)) 
 	{
 		if (nCmdShow == SW_SHOW || nCmdShow == SW_SHOWNORMAL  || nCmdShow == SW_MAXIMIZE || nCmdShow == SW_MAX || nCmdShow == SW_SHOWNA

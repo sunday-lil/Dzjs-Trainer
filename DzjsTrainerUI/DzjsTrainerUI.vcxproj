@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|Win32">
@@ -25,30 +25,35 @@
     <RootNamespace>DzjsTrainerUI</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
+  <PropertyGroup Label="Dependencies">
+    <!-- Boost 只被 TeacherEndpoint 用到（asio / system）。默认值是本机 vcpkg 布局，
+         换机器时用 -p:BoostIncludeDir=<路径> 覆盖，不要改这里。 -->
+    <BoostIncludeDir Condition="'$(BoostIncludeDir)' == ''">D:\原桌面\极域第三方教师端\cpp-gui\vcpkg_installed\x64-windows\include</BoostIncludeDir>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset Condition="Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v143</PlatformToolset><PlatformToolset Condition="!Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>StaticLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset Condition="Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v143</PlatformToolset><PlatformToolset Condition="!Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset Condition="Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v143</PlatformToolset><PlatformToolset Condition="!Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset Condition="Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v143</PlatformToolset><PlatformToolset Condition="!Exists('$(VCTargetsPath)\Platforms\$(Platform)\PlatformToolsets\v143')">v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -100,7 +105,7 @@
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;$(BoostIncludeDir);D:\原桌面\极域第三方教师端\cpp-gui\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;$(BoostIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 /Zc:char8_t- %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -143,7 +148,7 @@
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;$(BoostIncludeDir);D:\原桌面\极域第三方教师端\cpp-gui\vcpkg_installed\x64-windows\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)TeacherEndpoint;$(BoostIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <AdditionalOptions>/utf-8 /Zc:char8_t- %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
@@ -196,7 +201,6 @@
 	<ClInclude Include="TeacherEndpoint\teacher_service.hpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="TeacherConsole.cpp" />
     <ClCompile Include="BugReportWindow.cpp" />
     <ClCompile Include="DzjsTrainerUI.cpp" />
     <ClCompile Include="MainWindow.cpp" />
@@ -218,9 +222,10 @@
     <ResourceCompile Include="MaterialIcons.rc" />
   </ItemGroup>
   <ItemGroup>
-    <Image Include="..\assets\branding\DzjsTrainerBug.ico" />
-    <Image Include="..\assets\branding\DzjsTrainerLogo.ico" />
-    <Image Include="..\assets\branding\DzjsTrainerWarn.ico" />
+    <Image Include="..\icon1.ico" />
+    <Image Include="..\DzjsTrainerBug.ico" />
+    <Image Include="..\DzjsTrainerLogo.ico" />
+    <Image Include="..\DzjsTrainerWarn.ico" />
     <Image Include="res\bg-main-state.png" />
     <Image Include="res\bg-shadow.png" />
     <Image Include="res\btn-close.png" />
@@ -254,6 +259,10 @@
     </ProjectReference>
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CheckBoostIncludeDir" BeforeTargets="ClCompile">
+    <Error Condition="!Exists('$(BoostIncludeDir)\boost\asio.hpp')"
+           Text="找不到 Boost 头文件：$(BoostIncludeDir)。用 -p:BoostIncludeDir=&lt;路径&gt; 指定包含 boost/asio.hpp 的目录。" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
 </Project>

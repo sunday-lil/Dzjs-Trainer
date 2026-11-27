@@ -2,7 +2,13 @@
 #include "stdafx.h"
 #include <string>
 #include <list>
+#include <map>
+#include <set>
+#include <vector>
 #include "SysHlp.h"
+
+// EduProducts.h 那张产品表里的元素类型，只有 .cpp 需要完整定义。
+struct EduProduct;
 
 enum TrainerWorkerOp {
 	TrainerWorkerOpVirusBoom,
@@ -31,11 +37,17 @@ public:
 
 	virtual void OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD pid, bool byuser) {}
 	virtual void OnUpdateState(TrainerStatus status, LPCWSTR textMain, LPCWSTR textMore) {}
+	// 其他电子教室宿主（自动适配注入的那些进程）有增减时回调。
+	// count 是当前受控的宿主进程数，summary 形如「红蜘蛛 ×1、联想传奇 ×2」。
+	virtual void OnUpdateEduHosts(int count, LPCWSTR summary) {}
 	virtual void OnResolveBlackScreenWindow() {}
 	virtual void OnSimpleMessageCallback(LPCWSTR text) {}
 	virtual void OnBeforeSendStartConf() {}
 	virtual void OnAllowGbTop() {}
 	virtual void OnShowHelp() {}
+	// 被注入的教室进程里挡下了一次关机/重启/注销。api 是拦在哪个函数上
+	// （ExitWindowsEx / shutdown.exe / InitiateSystemShutdownExW …），只用于日志。
+	virtual void OnShutdownBlocked(LPCWSTR api) {}
 	virtual void OnSwitchLockStatus(bool locked) {}
 	virtual HWND GetMainHWND() { return NULL; }
 };
@@ -73,6 +85,31 @@ public:
 	virtual std::wstring GetCustomInjectedList() { return L""; }
 	// 进程选择器用 PID 查「已注入」标记。返回 bool 而不是容器，避免跨 DLL 传 STL。
 	virtual bool IsCustomInjected(DWORD pid) { return false; }
+
+	// 「自动接管其他电子教室」（EduProducts.h 里登记的产品）。关掉只是不再
+	// 自动注入新进程，已经注进去的宿主保持不动，等它们退出或被手动卸载。
+	virtual void SetEduCompatAutoInject(bool enabled) {}
+	virtual bool GetEduCompatAutoInject() { return true; }
+	virtual int GetEduHostCount() { return 0; }
+	// 某一款教室挂了多少个进程；product 传空按全部算。
+	virtual int GetEduHostCountOf(LPCWSTR product) { return 0; }
+	virtual std::wstring GetEduHostSummary() { return L""; }
+	// 结束已接管的电子教室宿主进程，返回实际结束的个数。product 为空表示全部；
+	// 给具体产品名时只结束那一款。界面上的「结束电子教室」按名字逐个调。
+	virtual int KillEduHosts(LPCWSTR product) { return 0; }
+	// 极域学生端的 exe 找不找得到。菜单据此决定要不要给「重启电子教室」这一条。
+	virtual bool IsStudentMainLocated() { return false; }
+	// 这款教室现在有没有进程在跑。和 GetEduHostCountOf 不是一回事：那个数的是
+	// 「已经注入的宿主」，刚被守护拉起来、还没轮到扫描的进程不算；菜单要的是
+	// 「能不能结束」，所以按进程本身判断。
+	virtual bool IsEduProductRunning(LPCWSTR product) { return false; }
+	// 某款教室现在能不能拉起来：记得它的学生端路径，或者它的服务/守护进程还在。
+	virtual bool CanStartEduHost(LPCWSTR product) { return false; }
+	// 「启动」某款教室（product 为空表示全部），返回是否真的发起了启动动作。
+	virtual bool StartEduHost(LPCWSTR product) { return false; }
+	// 让已注入的电子教室宿主重读 ini。界面上改了显示相关开关（信息流保护、
+	// 允许监看）之后调用，否则要等宿主重启或者下一次保存设置才生效。
+	virtual void SyncCustomHosts() {}
 };
 
 #ifdef JTEXPORT
@@ -109,6 +146,40 @@ public:
 	bool UninjectCustomProcess(LPCWSTR target, std::wstring* status) override;
 	std::wstring GetCustomInjectedList() override;
 	bool IsCustomInjected(DWORD pid) override;
+	void SetEduCompatAutoInject(bool enabled) override;
+	bool GetEduCompatAutoInject() override { return _EduCompatEnabled; }
+	int GetEduHostCount() override;
+	int GetEduHostCountOf(LPCWSTR product) override;
+	std::wstring GetEduHostSummary() override;
+	// 「在跑但还没接管」的产品名，用「、」连起来。标题用：进程明明在那儿，
+	// 界面不能一派「未运行」。
+	std::wstring GetEduPendingSummary();
+	int KillEduHosts(LPCWSTR product) override;
+	bool IsStudentMainLocated() override { return _StudentMainFileLocated; }
+	bool IsEduProductRunning(LPCWSTR product) override;
+	bool CanStartEduHost(LPCWSTR product) override;
+	bool StartEduHost(LPCWSTR product) override;
+	void SyncCustomHosts() override;
+
+	// 扫描 EduProducts.h 里登记的学生端进程，命中就按通用宿主注入。
+	// 一台机器可以同时装几套电子教室，一轮扫描会把命中的目标全部注进去。
+	// 只在 _EduCompatEnabled 打开时做事，失败的目标会被压住一段时间不重试。
+	void RunEduCompatInject();
+	// 结束某一款教室之前先停掉拉起它的服务（红蜘蛛的 checkrs.exe 这类），
+	// 否则学生端刚被杀就被重新拉起来。返回停掉的服务/进程个数。
+	int StopEduGuards(const EduProduct& product);
+	int StopServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
+	// 「启动」那一半：先把服务拉起来（它拉起学生端时用的参数和版本都对），
+	// 再恢复被挂起的守护进程，最后才按记住的路径直接拉学生端。
+	int StartServicesByImage(const wchar_t* exeName, const wchar_t* serviceName);
+	// 顺着宿主往上清：同目录（含子目录）的进程 + 非系统父进程。
+	int SweepEduCompanions(DWORD rootPid, const std::wstring& imagePath);
+	// 结束之后盯梢：产品会在几秒内把学生端重新拉起来（服务恢复、守护进程），
+	// 杀完就走等于没杀。每 2 秒看一眼，重新出现就再收一次并记下父进程。
+	void StepEduKillWatch();
+	void EduKillWatchExtend();
+	// 受控宿主有增减时通知界面。调用点只有注入成功、卸载、清理死进程三处。
+	void NotifyEduHosts();
 
 	bool Kill(bool autoWork = false);
 	bool KillStAuto();
@@ -138,8 +209,46 @@ private:
 		DWORD pid = 0;
 		std::wstring name;
 		bool is64 = false;
+		// 命中 EduProducts.h 的产品名（如「红蜘蛛」）。手动注入的普通进程为空，
+		// 界面据此把自动接管的目标和用户自己选的分开显示。
+		std::wstring product;
+		// 映像完整路径。结束之后「启动」要用它把学生端拉回来，所以注入时记下。
+		std::wstring path;
 	};
 	std::list<CustomInjectedProcess> _CustomInjected;
+	// 产品名 → 学生端 exe 路径。进程被结束（记录随之删掉）之后还要靠它恢复，
+	// 所以单独存一份，生命周期跟着进程走。
+	std::map<std::wstring, std::wstring> _EduLaunchPaths;
+	// 被我们挂起过的守护进程。NtSuspendProcess 是计数式的：同一个进程挂两次，
+	// 之后一次 NtResumeProcess 救不回来。「结束」在一次操作里会走两遍守护
+	// （停服务、清扫上游），靠这张表保证一个 PID 只挂一次。
+	std::vector<DWORD> _EduSuspendedGuards;
+
+	// 电子教室自动适配（见 EduProducts.h）。扫描本身有 10 秒间隔，失败目标
+	// 再压 10 分钟，避免「2 秒一次的重扫」把注入失败刷满日志。
+	bool _EduCompatEnabled = true;
+	ULONGLONG _LastEduCompatScan = 0;
+	// 「启动」之后的一小段窗口：守护进程拉起学生端要十几秒，这期间把扫描从
+	// 10 秒收紧到 2 秒，进程一出现就接管，界面不用等下一轮才改口。
+	ULONGLONG _EduStartWatchUntil = 0;
+	// 上一轮「在跑但还没接管」的产品清单。变了才刷标题，不然每十秒重绘一次。
+	std::wstring _EduPendingSummary;
+	std::map<DWORD, ULONGLONG> _EduInjectBlocked;
+	// 用户在「进程注入」里手动卸载过的目标：同一个进程不再自动注入回去，
+	// 进程退出后自动解禁（PID 会被复用，不能用它做长期标记）。
+	std::set<DWORD> _EduManualSkip;
+	// 「结束电子教室」之后的盯梢状态。product 为空表示全线结束。
+	bool _EduKillWatchActive = false;
+	std::wstring _EduKillWatchProduct;
+	std::vector<std::wstring> _EduKillWatchHosts;    // 学生端进程名（小写）
+	std::vector<std::wstring> _EduKillWatchGuards;   // 上游进程名（小写）
+	std::vector<std::wstring> _EduKillWatchDirectories; // 安装目录，目录内新增的一并清
+	ULONGLONG _EduKillWatchDeadline = 0;             // 安静这么久就收工
+	ULONGLONG _EduKillWatchHardDeadline = 0;         // 再能拉也不超过这个点
+	int _EduKillWatchRounds = 0;
+	// 64 位注入助手的等待上限。手动注入时用户知道自己在等，给足 40 秒；
+	// 自动扫描是后台行为，卡住的是界面线程，所以压到几秒就放弃、下一轮再试。
+	DWORD _Injector64TimeoutMs = 40000;
 	bool ResolveCustomTarget(LPCWSTR target, DWORD* outPid, std::wstring* outName, std::wstring* status);
 	bool IsSelfCustomTarget(DWORD pid, LPCWSTR name, std::wstring* status);
 	bool DetectTargetBitness(DWORD pid, bool* outIs64, std::wstring* status);

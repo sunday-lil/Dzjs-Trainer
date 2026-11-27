@@ -15,6 +15,10 @@
 #include "GuardProcess.h"
 #include "GuardInput.h"
 #include "GuardDisplay.h"
+// 电子教室产品识别表与主程序共用一份（DzjsTrainer/EduProducts.h）：
+// 主程序用它决定往哪个进程注入，这里用同一张表判断注入进来的宿主是不是
+// 「已知电子教室」，两边分开维护迟早会对不上。
+#include "EduProducts.h"
 #include <list>
 #include <string>
 #include <vector>
@@ -44,6 +48,9 @@
 #define TIMER_LIGNT_DELAY1 10014
 #define TIMER_LIGNT_DELAY2 10015
 #define TIMER_UI_HEARTBEAT 10016
+// 第三方宿主的全屏/置顶巡查。300ms 是「够快」和「别空转」之间取的：
+// 宿主把窗口撑满到我们缩回去，用户最多看到一瞬。
+#define TIMER_EDU_SWEEP 10017
 
 #define DirectorySeparatorChar L'\\'
 #define AltDirectorySeparatorChar  L'/'
@@ -65,6 +72,15 @@
 #define IDM_HELP_GB 25602
 #define IDM_CLOSE_GB 25603
 #define IDM_HELP_GB2 25604
+// 拒绝了全屏/置顶以后，用户还能从这里改回来并补做上一次被挡的请求。
+#define IDM_ALLOW_OPS 25605
+// 第三方宿主（红蜘蛛、伽卡他卡、联想传奇、任意注入进程）的右键菜单。
+// 单独一组 ID：极域那几条命令会把结果回传主程序，这套没有主程序可回传。
+#define IDM_EDU_HINT   25610
+#define IDM_EDU_FULL   25611
+#define IDM_EDU_TOP    25612
+#define IDM_EDU_ALLOW  25613
+#define IDM_EDU_CLOSE  25614
 
 // INVALID_HHOOK_MOUSE / INVALID_HHOOK_KEYBOARD 已移到 HooksCommon.h 供 guard 模块共用
 
@@ -141,8 +157,8 @@ DWORD uiThreadId = 0;
 DWORD initializeThreadId = 0;
 const UINT WM_HOOK_INITIALIZED = WM_APP + 1;
 const UINT WM_STATUS_APPEND = WM_APP + 2;
-// 指针消息的握手值：只有本模块知道，外部进程无法伪造出可被 delete[] 的地址。
-const WPARAM WM_STATUS_APPEND_MAGIC = 0x445A5321u;
+// 全屏/置顶询问：钩子只负责拦下并投递，真正的对话框在消息中心线程里弹。
+const UINT WM_DZJS_ASK_WINDOWOP = WM_APP + 3;
 DWORD WINAPI VHookInitializeThread(LPVOID lpThreadParameter);
 DWORD WINAPI VWatchdogThread(LPVOID lpThreadParameter);
 DWORD WINAPI VSendMessageBackThread(LPVOID lpThreadParameter);
@@ -159,6 +175,11 @@ bool allowMonitor = false, allowControl = false, allowGbTop = false, fakeFull = 
 doNotShowVirusWindow = true, forceDisableWatchDog = false;
 // 「是否动手」开关，默认全 0 = 只记录（见 HooksCommon.h 的说明）。
 bool blockWindowOps = false, blockDriverAccess = false;
+// 全屏/置顶询问默认开：它不改变窗口的最终样子，只是让用户先点个头。
+bool askWindowOps = true;
+// 关机拦截默认开。理由见 HooksCommon.h —— 它不是「防护策略」里的可选项，
+// 而是「机器别被教师端关掉」这条底线，所以 ini 缺键时按 TRUE 处理。
+bool blockShutdown = true;
 bool whitePreviewOnly = false;
 // 「进程注入」功能：主程序把本 DLL 注入到用户指定的非极域进程时，
 // VLoad() 走通用宿主分支。通用宿主不等待 LibTDMaster、不改教师端设置，
@@ -166,6 +187,11 @@ bool whitePreviewOnly = false;
 bool g_customHost = false;
 // [CustomInject] Mode=minimal 时跳过极域专属的显示域/驱动通信/远程运行钩子。
 bool g_customHookMinimal = false;
+// 命中 EduProducts.h 的产品表：宿主是已知电子教室的学生端。
+// 与泛化的 g_customHost 的区别是显示域 —— 这些产品的抓屏走常规 GDI
+// （BitBlt / GetDIBits / PrintWindow），不像极域有自己的 LibDeskMonitor，
+// 所以假桌面 + DC 拦截 + BitBlt 都得真的生效，否则「禁止教师看屏」形同虚设。
+bool g_eduHost = false;
 // 钩子调用跟踪开关，默认关（ini [JTSettings] HooksTrace=1 打开）。
 // 声明必须早于 VIsInIllegalWindows —— 那里会用到它。
 // 分域后 guard 模块也要读这个开关，故提升为外部链接（HooksCommon.h 里 extern）。
@@ -203,6 +229,13 @@ fnSetWindowLongA faSetWindowLongA = NULL;
 fnSetWindowLongW faSetWindowLongW = NULL;
 fnShowWindow faShowWindow = NULL;
 fnExitWindowsEx faExitWindowsEx = NULL;
+fnInitiateSystemShutdownExW faInitiateSystemShutdownExW = NULL;
+fnInitiateSystemShutdownExA faInitiateSystemShutdownExA = NULL;
+fnInitiateSystemShutdownW faInitiateSystemShutdownW = NULL;
+fnInitiateSystemShutdownA faInitiateSystemShutdownA = NULL;
+fnNtShutdownSystem faNtShutdownSystem = NULL;
+fnNtSetSystemPowerState faNtSetSystemPowerState = NULL;
+fnNtInitiatePowerAction faNtInitiatePowerAction = NULL;
 fnShellExecuteW faShellExecuteW = NULL;
 fnShellExecuteExW faShellExecuteExW = NULL;
 fnCreateProcessA faCreateProcessA = NULL;
@@ -383,6 +416,8 @@ hk33 = 0, hk34 = 0, hk35 = 0, hk36 = 0,
 hk37 = 0, hk38 = 0, hk39 = 0, hk40 = 0,
 hk41 = 0;
 BOOL hk42 = 0, hk43 = 0, hk44 = 0, hk45 = 0;
+// hk46..hk52：关机拦截（ExitWindowsEx 是 hk19，老的，跟着 ProhibitKillProcess 走）。
+BOOL hk46 = 0, hk47 = 0, hk48 = 0, hk49 = 0, hk50 = 0, hk51 = 0, hk52 = 0;
 
 volatile LONG jpegHookAttempted = 0;
 volatile LONG jpegHookLogPending = 0;
@@ -486,6 +521,9 @@ DWORD WINAPI VLoadBootstrapThread(LPVOID lpThreadParameter)
 	return 0;
 }
 
+// 定义在第三次全屏询问那一段，卸载时销毁第三方宿主的右键菜单。
+void VDestroyEduMenu();
+
 void VUnloadAll() {
 
 	if (loaded)
@@ -496,6 +534,7 @@ void VUnloadAll() {
 		{ VWndListGuard guard; jiYuWndCanSize.clear(); }
 		runOPWhiteList.clear();
 		if (hMenuGb) DestroyMenu(hMenuGb);
+		VDestroyEduMenu();
 		VUnInstallHooks();
 		loaded = false;
 	}
@@ -574,7 +613,12 @@ void VLoad()
 		// 都没跑到，等于注入无效。这里复用同一套初始化，让 34 项有序表照样安装。
 		// 不等待 LibTDMaster、不做 capture-helper 转发、不改极域专属设置。
 		g_customHost = true;
-		VDebugLog(L"VLoad custom host pid=%lu name=%s", GetCurrentProcessId(), name.c_str());
+		// path / name 来自 GetModuleFileName(NULL)，是宿主 exe 自己，不是本 DLL。
+		// 命中产品表就升级成「电子教室宿主」，显示域按极域那套走（见 VRunMain）。
+		const wchar_t* product = EduCompatMatch(name.c_str(), path.c_str());
+		g_eduHost = product != NULL;
+		VDebugLog(L"VLoad custom host pid=%lu name=%s product=%s",
+			GetCurrentProcessId(), name.c_str(), product ? product : L"(generic)");
 		VRunMain();
 	}
 
@@ -608,10 +652,28 @@ void VRunMain() {
 		WCHAR customMode[32] = {};
 		GetPrivateProfileString(L"CustomInject", L"Mode", L"full", customMode, 32, mainIniPath);
 		g_customHookMinimal = StrEqual(customMode, L"minimal") || StrEqual(customMode, L"MINIMAL");
-		// allowMonitor 仍然强制 TRUE：假桌面 + DC 拦截那套（hk26/27/33）在通用宿主里
-		// 没有 fakeDesktopWindow 可用，装上去只会把宿主自己的 GetDesktopWindow 打空。
-		allowMonitor = true;
-		whitePreviewOnly = false;
+		if (g_eduHost) {
+			// 电子教室宿主：显示域与极域同一口径 —— AllowMonitor / EnableVideoModify
+			// 由 ini 决定（VInitSettings 已经读过），假桌面照样创建、显示在屏幕外，
+			// 所以「禁止教师看屏」的白挡与 DC 拦截能真的生效。
+			// minimal 会跳过整个显示域，跟「和极域一致」直接冲突，这里强制 full。
+			if (g_customHookMinimal) {
+				g_customHookMinimal = false;
+				VDebugLog(L"VRunMain edu host ignores [CustomInject] Mode=minimal");
+			}
+			whitePreviewOnly = !allowMonitor;
+			// 教师端软件会在自己进程里抓屏，BitBlt 钩必须补上；极域那条线靠
+			// LibDeskMonitor/DispFilter，这里没有那些模块（见 Hook_BitBlt）。
+			VDebugLog(L"VRunMain edu host display domain per ini allowMonitor=%d videoModify=%d",
+				allowMonitor, g_VideoProps.m_EnableModifyVideoStream);
+		}
+		else {
+			// 泛化的自定义宿主：没有产品语义，不能替用户决定拦不拦屏。
+			// 假桌面 + DC 拦截那套（hk26/27/33）装上去只会把宿主自己的
+			// GetDesktopWindow 打空，所以监看一律放行。
+			allowMonitor = true;
+			whitePreviewOnly = false;
+		}
 		doNotShowVirusWindow = true;   // 不在用户指定的进程里弹状态窗口
 		forceDisableWatchDog = true;   // 没有极域 JPEG 状态可补装，不空转
 		if (g_customHookMinimal && g_VideoProps.m_EnableModifyVideoStream)
@@ -626,7 +688,7 @@ void VRunMain() {
 		mainIniPath, allowMonitor, whitePreviewOnly, allowAllRunOp, g_VideoProps.m_EnableModifyVideoStream);
 	// 构建标记：日志里有这一行才说明跑的是本次构建的 DLL。
 	// 排查"改了没生效"时先看它，省得在部署问题上兜圈子。
-	VDebugLog(L"hooks build=20261114-outctl-fix");
+	VDebugLog(L"hooks build=20261121-2030-edu-opask2");
 	// 走 minimal 还是全量集，由上面两个标志决定；全量集会接管极域的窗口/进程/网络接口，
 	// 把它记下来，出问题时一眼能看出走的是哪条分支。
 	VDebugLog(L"hooks mode=%s", (whitePreviewOnly || g_VideoProps.m_EnableModifyVideoStream) ? L"minimal" : L"full");
@@ -816,8 +878,9 @@ void VParamInit() {
 	AppendMenu(hMenuGb, MF_STRING , IDM_HELP_GB, L"DzjsTrainer 添加的菜单");
 	AppendMenu(hMenuGb, MF_STRING, IDM_HELP_GB2, L"DzjsTrainer 帮助");
 	AppendMenu(hMenuGb, MF_SEPARATOR, 0, NULL);
-	AppendMenu(hMenuGb, MF_STRING, IDM_FULL, L"广播窗口全屏");
-	AppendMenu(hMenuGb, MF_STRING, IDM_TOPMOST, L"广播窗口置顶");
+	AppendMenu(hMenuGb, MF_STRING, IDM_FULL, L"全屏显示");
+	AppendMenu(hMenuGb, MF_STRING, IDM_TOPMOST, L"窗口置顶");
+	AppendMenu(hMenuGb, MF_STRING, IDM_ALLOW_OPS, L"允许全屏和置顶");
 	AppendMenu(hMenuGb, MF_SEPARATOR, 0, NULL);
 	AppendMenu(hMenuGb, MF_STRING, IDM_CLOSE_GB, L"关闭广播窗口");
 
@@ -847,9 +910,18 @@ void VInitSettings()
 	GetPrivateProfileString(L"JTSettings", L"BlockWindowOps", L"FALSE", w, 32, mainIniPath);
 	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) blockWindowOps = true;
 	else blockWindowOps = false;
+	// 缺键时按开处理：全屏和置顶是最容易被拿来控场的两种操作，
+	// 默认问一句比默认放行更符合这个工具的存在意义。
+	GetPrivateProfileString(L"JTSettings", L"AskWindowOps", L"TRUE", w, 32, mainIniPath);
+	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) askWindowOps = false;
+	else askWindowOps = true;
 	GetPrivateProfileString(L"JTSettings", L"BlockDriverAccess", L"FALSE", w, 32, mainIniPath);
 	if (StrEqual(w, L"TRUE") || StrEqual(w, L"true") || StrEqual(w, L"1")) blockDriverAccess = true;
 	else blockDriverAccess = false;
+	// 关机拦截：唯一一个缺键时按**开**处理的开关，理由见 HooksCommon.h。
+	GetPrivateProfileString(L"JTSettings", L"BlockShutdown", L"TRUE", w, 32, mainIniPath);
+	if (StrEqual(w, L"FALSE") || StrEqual(w, L"false") || StrEqual(w, L"0")) blockShutdown = false;
+	else blockShutdown = true;
 	
 	GetPrivateProfileString(L"JTSettings", L"DoNotShowVirusWindow", L"TRUE", w, 32, mainIniPath);
 	if (!StrEqual(w, L"TRUE") && !StrEqual(w, L"true") && !StrEqual(w, L"1")) doNotShowVirusWindow = false;
@@ -1131,8 +1203,7 @@ void VOutPutStatus(const wchar_t* str, ...) {
 	if (!status)
 		return;
 	wcscpy_s(status, out.length() + 1, out.c_str());
-	if (!PostMessageW(hWndMsgCenter, WM_STATUS_APPEND, WM_STATUS_APPEND_MAGIC,
-		reinterpret_cast<LPARAM>(status)))
+	if (!PostMessageW(hWndMsgCenter, WM_STATUS_APPEND, 0, reinterpret_cast<LPARAM>(status)))
 		delete[] status;
 }
 bool VWindowTextIsGb(const wchar_t* text) {
@@ -1201,8 +1272,8 @@ void VFixGuangBoWindow(HWND hWnd)
 	GetSystemMenu(gbWindow, TRUE);
 	HMENU hMenu = GetSystemMenu(gbWindow, FALSE);
 	AppendMenu(hMenu, MF_SEPARATOR, MF_SEPARATOR, L"");
-	AppendMenu(hMenu, MF_STRING, IDM_FULL, L"广播窗口全屏");
-	AppendMenu(hMenu, MF_STRING, IDM_TOPMOST, L"广播窗口置顶");
+	AppendMenu(hMenu, MF_STRING, IDM_FULL, L"全屏显示");
+	AppendMenu(hMenu, MF_STRING, IDM_TOPMOST, L"窗口置顶");
 
 	LONG oldLong = GetWindowLong(gbWindow, GWL_EXSTYLE);
 	if ((oldLong & WS_EX_TOPMOST) == WS_EX_TOPMOST) {
@@ -1342,6 +1413,796 @@ void VSendMessageBack(LPCWSTR buff, HWND hDlg) {
 		}
 	}
 }
+// ---- 关机拦截的通知 ----------------------------------------------------------
+// 拦截本身在 GuardProcess 的 detour 里完成，这里只负责把「刚挡下一次关机」
+// 告诉主程序。走的是和 hkb: 状态回传同一条 WM_COPYDATA 通道，但**不能**复用
+// VSendMessageBack：那个函数在通用宿主（g_customHost）下直接丢弃回传，而
+// 红蜘蛛、伽卡他卡这些宿主恰恰也是通用宿主，挡下关机后主程序就什么都不知道了。
+struct ShutdownNotice
+{
+	std::wstring api;
+};
+
+static DWORD WINAPI VShutdownNoticeThread(LPVOID param)
+{
+	ShutdownNotice* notice = static_cast<ShutdownNotice*>(param);
+	if (!notice) return 0;
+
+	HWND receiver = FindControlWindow();
+	if (receiver) {
+		std::wstring message = L"hkb:shutdown:";
+		message += notice->api;
+		COPYDATASTRUCT copyData = { 0 };
+		copyData.lpData = const_cast<wchar_t*>(message.c_str());
+		copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (message.length() + 1));
+		DWORD_PTR response = 0;
+		ULONGLONG started = GetTickCount64();
+		LRESULT result = SendMessageTimeoutW(receiver, WM_COPYDATA, 0,
+			reinterpret_cast<LPARAM>(&copyData), SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &response);
+		VDebugLog(L"shutdown notice complete api=%s target=%p result=%lld error=%lu elapsedMs=%llu",
+			notice->api.c_str(), receiver, static_cast<long long>(result), GetLastError(),
+			GetTickCount64() - started);
+	}
+	else {
+		VDebugLog(L"shutdown notice dropped api=%s reason=receiver-not-found", notice->api.c_str());
+	}
+	delete notice;
+	return 0;
+}
+
+// ===== 全屏 / 置顶询问 ======================================================
+//
+// 决定按窗口记：-1 未定、0 拒绝、1 允许，窗口销毁时清。表满就淘汰最早的一条。
+// 同一时刻只问一个问题：正在问的时候再来请求，先拦下并记成 lastBlocked，
+// 用户从右键菜单放行时补做。
+//
+// 重放走的是 `ra*` / `fa*` 原始指针，不经过 detour，所以不会二次询问。
+
+// 定义在 namespace 之后，菜单和询问判据都要用。
+bool VEduRectCoversMonitor(HWND hWnd, long long w, long long h, int percent);
+
+namespace {
+
+enum { VOP_UNDECIDED = -1, VOP_DENY = 0, VOP_ALLOW = 1 };
+enum { VOP_FULL = 1, VOP_TOP = 2 };
+
+struct WindowOpState {
+	HWND            hwnd;
+	int             full;
+	int             top;
+	WindowOpRequest lastBlocked;
+	bool            hasLastBlocked;
+	// 右键菜单「全屏显示」要能退回来：进全屏前的矩形存这儿。
+	// 极域有主程序按 3/4 屏幕摆回去，第三方宿主没人管，只能自己记。
+	RECT            restore;
+	bool            hasRestore;
+	// 后台巡查专用：用户对「这个已经在全屏的窗口」选了「只拒绝这一次」。
+	// 窗口退出全屏后清掉，下次再铺满会重新问 —— 与钩子那条路径的语义一致。
+	bool            sweepSkip;
+};
+
+const int kOpStateCount = 12;
+WindowOpState g_opStates[kOpStateCount];
+
+CRITICAL_SECTION g_opCs;
+volatile LONG g_opCsInit = 0;
+bool g_opAsking = false;
+WindowOpRequest g_pendingReq;
+int  g_pendingWant = 0;
+HWND g_pendingHwnd = NULL;
+
+void VEnsureOpCs()
+{
+	if (InterlockedCompareExchange(&g_opCsInit, 1, 0) == 0)
+		InitializeCriticalSection(&g_opCs);
+}
+
+// 调用方必须已经持有 g_opCs。
+WindowOpState* VFindOpStateLocked(HWND hWnd, bool create)
+{
+	WindowOpState* spare = NULL;
+	for (int i = 0; i < kOpStateCount; ++i) {
+		if (g_opStates[i].hwnd == hWnd) return &g_opStates[i];
+		if (!g_opStates[i].hwnd && !spare) spare = &g_opStates[i];
+	}
+	if (!create) return NULL;
+	if (!spare) {
+		// 表满：丢掉最早的一条（数组顺序就是插入顺序）。
+		MoveMemory(&g_opStates[0], &g_opStates[1], sizeof(WindowOpState) * (kOpStateCount - 1));
+		spare = &g_opStates[kOpStateCount - 1];
+	}
+	ZeroMemory(spare, sizeof(*spare));
+	spare->hwnd = hWnd;
+	spare->full = VOP_UNDECIDED;
+	spare->top = VOP_UNDECIDED;
+	return spare;
+}
+
+void VReplayWindowOp(const WindowOpRequest& req)
+{
+	if (!req.hwnd || !IsWindow(req.hwnd)) return;
+	switch (req.source) {
+	case VOP_SRC_SETWINDOWPOS:
+		if (raSetWindowPos)
+			raSetWindowPos(req.hwnd, req.insertAfter, req.x, req.y, req.cx, req.cy, req.flags);
+		break;
+	case VOP_SRC_MOVEWINDOW:
+		if (raMoveWindow)
+			raMoveWindow(req.hwnd, req.x, req.y, req.cx, req.cy, TRUE);
+		break;
+	case VOP_SRC_SETWINDOWLONG:
+		if (req.wide) {
+			if (faSetWindowLongW) faSetWindowLongW(req.hwnd, req.index, req.value);
+		}
+		else if (faSetWindowLongA) {
+			faSetWindowLongA(req.hwnd, req.index, req.value);
+		}
+		break;
+	case VOP_SRC_SHOWWINDOW:
+		// 最大化请求没有尺寸参数，nCmdShow 存在 x 字段里。
+		if (faShowWindow) faShowWindow(req.hwnd, req.x);
+		break;
+	default:
+		break;
+	}
+}
+
+// ---- 第三方宿主的右键菜单 ---------------------------------------------------
+//
+// 极域那个广播窗口有自己的 JiYuWndProc 菜单，菜单项把意图发回主程序，由主程序
+// 统一摆位置。红蜘蛛、伽卡他卡、联想传奇这些宿主没有主程序配合，VSendMessageBack
+// 在 g_customHost 下也是丢弃的，所以菜单必须自己动手。
+//
+// 所有改动都走 `ra*` / `fa*` 原始指针：经过 detour 的话会再次触发询问，
+// 点「全屏」自己弹出一个「是否允许全屏」的框，很荒谬。
+
+const wchar_t* kEduOldProcProp = L"DzjsTrainerEduOldProc";
+HMENU hMenuEdu = NULL;
+
+// 窗口覆盖了所在显示器的多少。多屏时以窗口所在那块屏为准，不拿主屏算 ——
+// 副屏 2K、主屏 1080p 的机器上，用主屏尺寸判副屏全屏会永远差一截。
+bool VEduWindowCoversMonitor(HWND hWnd, int percent)
+{
+	RECT rc;
+	if (!GetWindowRect(hWnd, &rc)) return false;
+	return VEduRectCoversMonitor(hWnd,
+		(long long)rc.right - rc.left, (long long)rc.bottom - rc.top, percent);
+}
+
+void VEnsureEduMenu()
+{
+	if (hMenuEdu) return;
+	hMenuEdu = CreatePopupMenu();
+	if (!hMenuEdu) return;
+	// 第一项不可点，说明这个菜单是谁加的。极域那边也是这个写法。
+	AppendMenu(hMenuEdu, MF_STRING | MF_GRAYED, IDM_EDU_HINT, L"DzjsTrainer 添加的菜单");
+	AppendMenu(hMenuEdu, MF_SEPARATOR, 0, NULL);
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_FULL, L"全屏显示");
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_TOP, L"窗口置顶");
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_ALLOW, L"允许全屏和置顶");
+	AppendMenu(hMenuEdu, MF_SEPARATOR, 0, NULL);
+	AppendMenu(hMenuEdu, MF_STRING, IDM_EDU_CLOSE, L"关闭这个窗口");
+}
+
+void VEduSetFull(HWND hWnd, bool full)
+{
+	if (raSetWindowPos == NULL) return;   // 钩子还没装好，什么都不做
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return;
+
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, true);
+	RECT restore = {};
+	bool hasRestore = false;
+	if (state) {
+		if (full && !state->hasRestore) {
+			// 只在第一次进全屏时记原位置；反复点「全屏」不该把全屏矩形记成原位置。
+			if (GetWindowRect(hWnd, &state->restore)) state->hasRestore = true;
+		}
+		restore = state->restore;
+		hasRestore = state->hasRestore;
+	}
+	if (state && !full) {
+		state->hasRestore = false;
+	}
+	LeaveCriticalSection(&g_opCs);
+
+	if (full) {
+		const int w = mi.rcMonitor.right - mi.rcMonitor.left;
+		const int h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+		raSetWindowPos(hWnd, NULL, mi.rcMonitor.left, mi.rcMonitor.top, w, h,
+			SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		return;
+	}
+
+	if (hasRestore && restore.right > restore.left && restore.bottom > restore.top) {
+		raSetWindowPos(hWnd, NULL, restore.left, restore.top,
+			restore.right - restore.left, restore.bottom - restore.top,
+			SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+		return;
+	}
+	// 没有记录（注入晚于全屏，用户只能选退出）：按极域的 3/4 屏幕摆回去，
+	// 总比留在全屏没反应强。
+	const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+	const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	const int w = monW * 3 / 4, h = monH * 4 / 5;
+	raSetWindowPos(hWnd, NULL, mi.rcMonitor.left + (monW - w) / 2,
+		mi.rcMonitor.top + (monH - h) / 2, w, h,
+		SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+void VEduSetTopmost(HWND hWnd, bool top)
+{
+	if (raSetWindowPos == NULL) return;
+	raSetWindowPos(hWnd, top ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void VEduUpdateMenu(HWND hWnd)
+{
+	if (!hMenuEdu) return;
+	const bool full = VEduWindowCoversMonitor(hWnd, 95);
+	const bool top = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == WS_EX_TOPMOST;
+	ModifyMenuW(hMenuEdu, IDM_EDU_FULL, MF_BYCOMMAND | MF_STRING, IDM_EDU_FULL,
+		full ? L"退出全屏" : L"全屏显示");
+	ModifyMenuW(hMenuEdu, IDM_EDU_TOP, MF_BYCOMMAND | MF_STRING, IDM_EDU_TOP,
+		top ? L"取消置顶" : L"窗口置顶");
+	CheckMenuItem(hMenuEdu, IDM_EDU_FULL, MF_BYCOMMAND | (full ? MF_CHECKED : MF_UNCHECKED));
+	CheckMenuItem(hMenuEdu, IDM_EDU_TOP, MF_BYCOMMAND | (top ? MF_CHECKED : MF_UNCHECKED));
+}
+
+void VEduShowMenu(HWND hWnd, POINT screenPos)
+{
+	VEnsureEduMenu();
+	VEduUpdateMenu(hWnd);
+	const int id = TrackPopupMenu(hMenuEdu,
+		TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+		screenPos.x, screenPos.y, 0, hWnd, NULL);
+	// 菜单关掉后补一条空消息：宿主的消息循环不一定会重画，菜单有时会留在屏幕上。
+	PostMessageW(hWnd, WM_NULL, 0, 0);
+	if (!id) return;
+
+	switch (id) {
+	case IDM_EDU_FULL:
+		VEduSetFull(hWnd, !VEduWindowCoversMonitor(hWnd, 95));
+		break;
+	case IDM_EDU_TOP: {
+		const bool top = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == WS_EX_TOPMOST;
+		VEduSetTopmost(hWnd, !top);
+		break;
+	}
+	case IDM_EDU_ALLOW:
+		VGrantWindowOps(hWnd);
+		break;
+	case IDM_EDU_CLOSE: {
+		WCHAR title[96] = L"";
+		GetWindowTextW(hWnd, title, _countof(title));
+		WCHAR text[320];
+		swprintf_s(text, L"确定要关闭「%s」吗？\n\n这是电子教室自己的窗口，关掉可能中断教师端的投屏。",
+			title[0] ? title : L"远程窗口");
+		if (MessageBoxW(hWnd, text, L"DzjsTrainer - 提示",
+				MB_YESNO | MB_ICONEXCLAMATION | MB_TOPMOST | MB_DEFBUTTON2) == IDYES) {
+			// 跨线程销毁窗口不成立（DestroyWindow 只能动本线程的窗口），
+			// 投一条 WM_CLOSE 让宿主自己走关闭流程。
+			PostMessageW(hWnd, WM_CLOSE, 0, 0);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+LRESULT CALLBACK VEduSubclassProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	WNDPROC oldProc = (WNDPROC)GetPropW(hWnd, kEduOldProcProp);
+
+	if (message == WM_RBUTTONUP || (message == WM_NCRBUTTONUP && wParam == HTCAPTION)) {
+		// 只在铺满屏幕的窗口上弹：窗口化时右键多半是宿主自己的菜单，
+		// 抢过来会把别人的功能弄没。
+		if (VEduWindowCoversMonitor(hWnd, 85)) {
+			POINT pos;
+			if (message == WM_RBUTTONUP) {
+				pos.x = GET_X_LPARAM(lParam);
+				pos.y = GET_Y_LPARAM(lParam);
+				ClientToScreen(hWnd, &pos);
+			}
+			else {
+				pos.x = GET_X_LPARAM(lParam);
+				pos.y = GET_Y_LPARAM(lParam);
+			}
+			VEduShowMenu(hWnd, pos);
+			return 0;
+		}
+	}
+	else if (message == WM_NCDESTROY) {
+		RemovePropW(hWnd, kEduOldProcProp);
+		VForgetWindowOp(hWnd);
+	}
+
+	if (oldProc) return CallWindowProcW(oldProc, hWnd, message, wParam, lParam);
+	return DefWindowProcW(hWnd, message, wParam, lParam);
+}
+
+// 给第三方宿主的窗口挂上菜单。重复调用无害：属性在就说明已经挂过。
+void VAttachEduWindow(HWND hWnd)
+{
+	if (!g_customHost || !hWnd || !IsWindow(hWnd)) return;
+	if (GetPropW(hWnd, kEduOldProcProp)) return;
+	// 只处理宿主自己的顶层窗口。子窗口（渲染面、工具栏）右键另有主人。
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return;
+	if (GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) return;
+	if (hWnd == hWndMsgCenter) return;
+	if (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return;
+
+	WNDPROC oldProc = (WNDPROC)GetWindowLongPtrW(hWnd, GWLP_WNDPROC);
+	if (!oldProc || oldProc == VEduSubclassProc) return;
+	if (!SetPropW(hWnd, kEduOldProcProp, (HANDLE)oldProc)) return;
+	SetWindowLongPtrW(hWnd, GWLP_WNDPROC, (LONG_PTR)VEduSubclassProc);
+	WCHAR title[64] = L"";
+	GetWindowTextW(hWnd, title, _countof(title));
+	VDebugLog(L"edu window menu attached hwnd=%p title=%s", hWnd, title);
+}
+
+// 注入往往发生在宿主已经全屏之后（主程序刚启动、刚开始扫描），那时候一次
+// 窗口钩子都没走过，菜单自然挂不上。这里把已经铺满屏幕的窗口补挂一遍。
+BOOL CALLBACK VEduEnumWindowsProc(HWND hWnd, LPARAM)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid != GetCurrentProcessId()) return TRUE;
+	if (!VEduWindowCoversMonitor(hWnd, 60)) return TRUE;
+	VAttachEduWindow(hWnd);
+	// 注入时就已经全屏的窗口：当作用户已知的状态记成「允许」。不这么做的话，
+	// 300ms 后的第一趟巡查就会拿它开刀 —— 人家本来就在上课，我们上去弹个框，
+	// 答「否」还要把画面缩小。
+	if (!VEduWindowCoversMonitor(hWnd, 90)) return TRUE;
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, true);
+	if (state) {
+		if (state->full == VOP_UNDECIDED) state->full = VOP_ALLOW;
+		// 置顶只跟着现状记：本来就没置顶的窗口，以后再置顶还得问。
+		if ((GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) && state->top == VOP_UNDECIDED)
+			state->top = VOP_ALLOW;
+	}
+	LeaveCriticalSection(&g_opCs);
+	return TRUE;
+}
+
+void VAttachEduWindows()
+{
+	if (!g_customHost) return;
+	EnumWindows(VEduEnumWindowsProc, 0);
+}
+
+// 给主程序回一行「刚才那个询问的结果」。走的是关机通知那条路：
+// VSendMessageBack 在通用宿主里整体关闭（怕误触发主程序的失联判定），
+// 但这几行诊断没有副作用，需要单独放行 —— 注入进程自己的日志在人家安装
+// 目录里，用户平时看不到，出了问题只能靠主日志对上时间。
+void VEduOpNotice(const wchar_t* result, HWND hwnd)
+{
+	if (!result) return;
+	HWND receiver = FindControlWindow();
+	if (!receiver) {
+		VDebugLog(L"edu op notice dropped result=%s reason=receiver-not-found", result);
+		return;
+	}
+	WCHAR message[128];
+	swprintf_s(message, L"hkb:eduop:%s:%lld", result, (long long)(INT_PTR)hwnd);
+	COPYDATASTRUCT copyData = { 0 };
+	copyData.lpData = message;
+	copyData.cbData = static_cast<DWORD>(sizeof(WCHAR) * (wcslen(message) + 1));
+	DWORD_PTR response = 0;
+	SendMessageTimeoutW(receiver, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&copyData),
+		SMTO_ABORTIFHUNG | SMTO_BLOCK, 500, &response);
+	VDebugLog(L"edu op notice result=%s hwnd=%p response=%llu", result, hwnd,
+		static_cast<unsigned long long>(response));
+}
+
+// 由消息中心线程调用（WM_DZJS_ASK_WINDOWOP）。这里可以安全地弹模态框：
+// 极域的 UI 线程早被钩子放回去了，等答复的只是我们自己的窗口线程。
+void VAskWindowOp()
+{
+	WindowOpRequest req = {};
+	int want = 0;
+	HWND hwnd = NULL;
+
+	EnterCriticalSection(&g_opCs);
+	req = g_pendingReq;
+	want = g_pendingWant;
+	hwnd = g_pendingHwnd;
+	g_pendingHwnd = NULL;
+	g_pendingWant = 0;
+	ZeroMemory(&g_pendingReq, sizeof(g_pendingReq));
+	// g_opAsking 在这里**不能**清：框还开着的时候又来一个请求，得先挡下记成
+	// lastBlocked。清了就会出现第二个模态框叠在第一个上面（后台巡查每 300ms
+	// 一趟，窗口还在全屏、决定还没落库，正好会一直问）。
+	LeaveCriticalSection(&g_opCs);
+
+	if (!hwnd || !IsWindow(hwnd) || !want) {
+		EnterCriticalSection(&g_opCs);
+		g_opAsking = false;
+		LeaveCriticalSection(&g_opCs);
+		return;
+	}
+
+	WCHAR title[96] = L"";
+	GetWindowTextW(hwnd, title, _countof(title));
+
+	const wchar_t* action = (want == VOP_FULL) ? L"全屏显示"
+		: (want == VOP_TOP) ? L"置顶显示"
+		: L"全屏并置顶显示";
+
+	// 第三方宿主（红蜘蛛、伽卡他卡，或用户自己注入的进程）未必是「电子教室」，
+	// 文案跟着宿主走，免得在一个普通程序里冒出「电子教室正在请求」。
+	const wchar_t* who = (g_customHost && !g_eduHost) ? L"已注入的程序" : L"电子教室";
+
+	WCHAR text[640];
+	swprintf_s(text,
+		L"%s正在请求把「%s」%s。\n\n"
+		L"是：允许，本窗口以后不再询问\n"
+		L"否：拒绝，本窗口以后不再询问\n"
+		L"取消：只拒绝这一次",
+		who, title[0] ? title : L"远程窗口", action);
+
+	// MB_TOPMOST 是必须的：请求的往往正是「铺满整屏」的那个窗口，
+	// 不置顶就会被它盖住，学生只会看到一片全屏画面而不知道有人在问什么。
+	int answer = MessageBoxW(hWndMsgCenter, text, L"DzjsTrainer - 窗口操作确认",
+		MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND | MB_DEFBUTTON2);
+
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hwnd, true);
+	if (state) {
+		if (answer == IDYES) {
+			if (want & VOP_FULL) {
+				state->full = VOP_ALLOW;
+			}
+			if (want & VOP_TOP) {
+				state->top = VOP_ALLOW;
+			}
+			state->hasLastBlocked = false;
+			state->sweepSkip = false;
+		}
+		else if (answer == IDNO) {
+			if (want & VOP_FULL) state->full = VOP_DENY;
+			if (want & VOP_TOP)  state->top = VOP_DENY;
+		}
+		else if (req.source == VOP_SRC_SWEEP) {
+			// 「取消」= 只拒绝这一次。巡查没有「下一次调用」可以拦，窗口就摆在那儿，
+			// 所以记成「先别再问」，等它退出全屏再重新开张。
+			state->sweepSkip = true;
+		}
+	}
+	g_opAsking = false;
+	LeaveCriticalSection(&g_opCs);
+
+	// 主程序每两秒扫一次广播窗口：gbFullManual 为假就把窗口加回边框、按 3/4
+	// 屏幕摆好，setAllowGbTop 为假就摘掉置顶 —— 学生刚允许的东西会被它拆掉。
+	// 所以放行之后必须把这两个开关同步过去。
+	if (answer == IDYES) {
+		if ((want & VOP_FULL) && !gbFullManual) {
+			gbFullManual = true;
+			VSendMessageBack(L"hkb:gbmfull", hWndMsgCenter);
+		}
+		if ((want & VOP_TOP) && !allowGbTop) {
+			allowGbTop = true;
+			VSendMessageBack(L"hkb:algbtop", hWndMsgCenter);
+		}
+	}
+
+	VOutPutStatus(L"[W] 窗口操作 %s hwnd=%p 答复=%d", action, hwnd, answer);
+	// 第三方宿主的日志在人家自己的安装目录里，用户平时看不到。把结论送一份
+	// 给主程序记账：出现「明明弹了框却说没弹」时，主日志里能对上是哪一步。
+	VEduOpNotice(answer == IDYES ? L"allow" : answer == IDNO ? L"deny" : L"once", hwnd);
+	if (answer == IDYES) VReplayWindowOp(req);
+}
+
+} // namespace
+
+// 给 VUnloadAll 用。DLL 卸载时不销毁，菜单句柄会跟着注入进程一直留着。
+void VDestroyEduMenu()
+{
+	if (hMenuEdu) {
+		DestroyMenu(hMenuEdu);
+		hMenuEdu = NULL;
+	}
+}
+
+// 给定一块目标尺寸，看它铺满所在显示器多少。全屏请求拿的就是目标尺寸，
+// 置顶请求因为 SetWindowLong 不带尺寸，改取当前矩形。
+bool VEduRectCoversMonitor(HWND hWnd, long long w, long long h, int percent)
+{
+	if (w <= 0 || h <= 0) return false;
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return false;
+	const long long monW = mi.rcMonitor.right - mi.rcMonitor.left;
+	const long long monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	if (monW <= 0 || monH <= 0) return false;
+	return w * h * 100 >= monW * monH * percent;
+}
+
+bool VEduFullScreenRequest(HWND hWnd, int x, int y, int cx, int cy)
+{
+	if (!g_customHost || cx <= 0 || cy <= 0) return false;
+	HMONITOR mon = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST);
+	MONITORINFO mi = { sizeof(mi) };
+	if (!GetMonitorInfoW(mon, &mi)) return false;
+	const int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+	const int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+	if (monW <= 0 || monH <= 0) return false;
+	// 起点允许 8 像素误差：无边框窗口常把边框算进位置里。
+	if (x < mi.rcMonitor.left - 8 || x > mi.rcMonitor.left + 8) return false;
+	if (y < mi.rcMonitor.top - 8 || y > mi.rcMonitor.top + 8) return false;
+	return (long long)cx * cy * 100 >= (long long)monW * monH * 90;
+}
+
+bool VWindowOpAskable(HWND hWnd, const WindowOpRequest* req, bool full, bool top)
+{
+	if (!hWnd || !IsWindow(hWnd)) return false;
+	// 极域：主程序点过名的窗口（广播、黑屏），名单说了算。
+	if (VIsInIllegalWindows(hWnd)) return true;
+	if (!g_customHost) return false;
+
+	// 其他电子教室 / 任意注入宿主：没有名单可分，只能按「谁在把自己铺满」认。
+	// 条件卡在本进程的顶层窗口上，宿主子窗口（渲染面、工具栏）不归这个菜单管。
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid != GetCurrentProcessId()) return false;
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return false;
+	if (GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) return false;
+	if (hWnd == hWndMsgCenter) return false;
+	if (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return false;
+
+	// 全屏请求本身就是铺满，直接问。置顶请求要看面积：宿主的工具条常年置顶，
+	// 每条都弹框会把用户烦死，也分不清哪个才是上课画面。
+	if (full) {
+		// 不再按当前尺寸设门槛。Delphi 那套（伽卡他卡就是）是先把
+		// WindowState 设成 wsMaximized、窗口尺寸随后才撑开，问的时候它还是
+		// 原来的小尺寸；按面积判会全部漏掉。要不要问由调用方决定 ——
+		// ShowWindow 只在最大化/已经铺满时才走到这里，后台巡查只在 >=90% 时。
+		return true;
+	}
+	if (!top) return false;
+
+	long long w = 0, h = 0;
+	if (req) {
+		w = req->cx;
+		h = req->cy;
+	}
+	if (w <= 0 || h <= 0) {
+		RECT rc;
+		if (!GetWindowRect(hWnd, &rc)) return false;
+		w = (long long)rc.right - rc.left;
+		h = (long long)rc.bottom - rc.top;
+	}
+	// 50%：极域窗口化时是 3/4 × 4/5 = 60% 面积，留一点余量给不同产品的默认尺寸。
+	return VEduRectCoversMonitor(hWnd, w, h, 50);
+}
+
+bool VAllowWindowOp(const WindowOpRequest& req, bool full, bool top)
+{
+	const int want = (full ? VOP_FULL : 0) | (top ? VOP_TOP : 0);
+	if (!want) return true;
+	if (!loaded || !askWindowOps) return true;
+	// 极域的名单窗口 + 其他适配产品的「大窗口」都在这里过一遍。
+	// 别的进程的窗口不在讨论范围里。
+	if (!VWindowOpAskable(req.hwnd, &req, full, top)) return true;
+	// 第三方宿主没有 JiYuWndProc 那套菜单，第一次问的时候顺手挂一个。
+	if (g_customHost && !VIsInIllegalWindows(req.hwnd))
+		VAttachEduWindow(req.hwnd);
+	// 还没有消息中心可问（DLL 早期，或主程序已经退出）：不静默干预。
+	if (!hWndMsgCenter) return true;
+
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+
+	// 顺手回收已经销毁的窗口，免得多开几次广播就把表占满。
+	for (int i = 0; i < kOpStateCount; ++i) {
+		if (g_opStates[i].hwnd && !IsWindow(g_opStates[i].hwnd))
+			ZeroMemory(&g_opStates[i], sizeof(g_opStates[i]));
+	}
+
+	WindowOpState* state = VFindOpStateLocked(req.hwnd, true);
+	if (!state) {
+		LeaveCriticalSection(&g_opCs);
+		return true;
+	}
+
+	int need = 0;
+	if (full && state->full == VOP_UNDECIDED) need |= VOP_FULL;
+	if (top  && state->top  == VOP_UNDECIDED) need |= VOP_TOP;
+
+	if (!need) {
+		const bool denied = (full && state->full == VOP_DENY) ||
+		                    (top  && state->top  == VOP_DENY);
+		if (!denied) state->hasLastBlocked = false;
+		LeaveCriticalSection(&g_opCs);
+		return !denied;
+	}
+
+	state->lastBlocked = req;
+	state->hasLastBlocked = true;
+
+	if (g_opAsking) {
+		// 已经有一个框在等回答；这次先挡，等用户从右键菜单补。
+		LeaveCriticalSection(&g_opCs);
+		return false;
+	}
+
+	g_opAsking = true;
+	g_pendingReq = req;
+	g_pendingWant = need;
+	g_pendingHwnd = req.hwnd;
+	LeaveCriticalSection(&g_opCs);
+
+	const bool posted = PostMessageW(hWndMsgCenter, WM_DZJS_ASK_WINDOWOP, 0, 0) != FALSE;
+	if (!posted) {
+		EnterCriticalSection(&g_opCs);
+		g_opAsking = false;
+		g_pendingHwnd = NULL;
+		g_pendingWant = 0;
+		ZeroMemory(&g_pendingReq, sizeof(g_pendingReq));
+		LeaveCriticalSection(&g_opCs);
+	}
+	return false;
+}
+
+// ===== 第三方宿主：全屏 / 置顶的后台巡查 ====================================
+//
+// 钩子只看得见走了导出 API 的那些路径。红蜘蛛、伽卡他卡这类宿主经常是
+// CreateWindowEx 直接按整屏建窗口、再 ShowWindow(SW_SHOW)，或者走
+// SetWindowPlacement 恢复最大化 —— 一次 SetWindowPos 都不经过，钩子全程沉默。
+// 这里每 300ms 巡一遍本进程的顶层窗口兜底：发现「已经铺满、还没问过」的
+// 窗口补问一次，答「否」就把它缩回 3/4 屏幕。
+//
+// 只在消息中心线程上跑：EnumWindows 和弹框都在那儿，宿主自己的 UI 线程
+// 一根手指头都不碰。
+struct EduSweepState {
+	int  full;
+	bool skip;
+};
+
+EduSweepState VEduSweepStateOf(HWND hWnd, bool isFull)
+{
+	EduSweepState out = { VOP_UNDECIDED, false };
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, false);
+	if (state) {
+		// 退出全屏就把「只拒绝这一次」清掉：下次再铺满重新问。
+		if (!isFull) state->sweepSkip = false;
+		out.full = state->full;
+		out.skip = state->sweepSkip;
+	}
+	LeaveCriticalSection(&g_opCs);
+	return out;
+}
+
+BOOL CALLBACK VEduSweepProc(HWND hWnd, LPARAM)
+{
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hWnd, &pid);
+	if (pid != GetCurrentProcessId()) return TRUE;
+	if (hWnd == hWndMsgCenter || hWnd == fakeDesktopWindow) return TRUE;
+	if (GetAncestor(hWnd, GA_ROOT) != hWnd) return TRUE;
+	if (GetWindowLongW(hWnd, GWL_STYLE) & WS_CHILD) return TRUE;
+	if (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+
+	const bool full = VEduWindowCoversMonitor(hWnd, 90);
+	const EduSweepState state = VEduSweepStateOf(hWnd, full);
+	if (!full) return TRUE;
+	if (!IsWindowVisible(hWnd) || IsIconic(hWnd)) return TRUE;
+	if (state.full == VOP_ALLOW) return TRUE;
+	if (state.full == VOP_DENY) {
+		// 用户说过不许全屏。窗口还铺着，只能说明宿主自己又撑回来了，缩回去。
+		// 最大化过的窗口先还原：带 WS_MAXIMIZE 的时候 SetWindowPos 的尺寸不生效。
+		if ((GetWindowLongW(hWnd, GWL_STYLE) & WS_MAXIMIZE) && faShowWindow)
+			faShowWindow(hWnd, SW_RESTORE);
+		VEduSetFull(hWnd, false);
+		return TRUE;
+	}
+	if (state.skip || g_opAsking) return TRUE;
+
+	const bool topmost = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+	RECT rc = {};
+	GetWindowRect(hWnd, &rc);
+	WindowOpRequest req = {};
+	req.source = VOP_SRC_SWEEP;
+	req.hwnd = hWnd;
+	req.x = rc.left;
+	req.y = rc.top;
+	req.cx = rc.right - rc.left;
+	req.cy = rc.bottom - rc.top;
+	req.wide = true;
+	WCHAR title[64] = L"";
+	GetWindowTextW(hWnd, title, _countof(title));
+	VDebugLog(L"edu sweep found full screen hwnd=%p %dx%d topmost=%d title=%s",
+		hWnd, req.cx, req.cy, topmost, title);
+	VAllowWindowOp(req, true, topmost);
+	return TRUE;
+}
+
+void VEduSweepWindowOps()
+{
+	if (!g_customHost || !loaded || !askWindowOps || !hWndMsgCenter) return;
+	EnumWindows(VEduSweepProc, 0);
+}
+
+void VForgetWindowOp(HWND hWnd)
+{
+	if (!hWnd) return;
+	VEnsureOpCs();
+	EnterCriticalSection(&g_opCs);
+	for (int i = 0; i < kOpStateCount; ++i) {
+		if (g_opStates[i].hwnd == hWnd) {
+			ZeroMemory(&g_opStates[i], sizeof(g_opStates[i]));
+			break;
+		}
+	}
+	if (g_pendingHwnd == hWnd) {
+		g_pendingHwnd = NULL;
+		g_pendingWant = 0;
+		ZeroMemory(&g_pendingReq, sizeof(g_pendingReq));
+		g_opAsking = false;
+	}
+	LeaveCriticalSection(&g_opCs);
+}
+
+void VGrantWindowOps(HWND hWnd)
+{
+	if (!hWnd) return;
+	VEnsureOpCs();
+	WindowOpRequest replay = {};
+	bool hasReplay = false;
+
+	EnterCriticalSection(&g_opCs);
+	WindowOpState* state = VFindOpStateLocked(hWnd, true);
+	if (state) {
+		state->full = VOP_ALLOW;
+		state->top = VOP_ALLOW;
+		if (state->hasLastBlocked) {
+			replay = state->lastBlocked;
+			hasReplay = true;
+			state->hasLastBlocked = false;
+		}
+	}
+	LeaveCriticalSection(&g_opCs);
+
+	// 同 VAskWindowOp：不同步这两个开关，主程序下一轮扫描就会把窗口改回窗口化、摘掉置顶。
+	if (!gbFullManual) {
+		gbFullManual = true;
+		VSendMessageBack(L"hkb:gbmfull", hWndMsgCenter);
+	}
+	if (!allowGbTop) {
+		allowGbTop = true;
+		VSendMessageBack(L"hkb:algbtop", hWndMsgCenter);
+	}
+
+	if (hasReplay) VReplayWindowOp(replay);
+}
+
+void VNotifyShutdownBlocked(const wchar_t* api)
+{
+	// 一次关机尝试常常连着走好几层（ExitWindowsEx → InitiateSystemShutdownEx →
+	// NtSetSystemPowerState），每个 detour 都弹一条提示会刷屏。2 秒内只报第一条。
+	static volatile LONG lastTick = 0;
+	const LONG now = static_cast<LONG>(GetTickCount64());
+	const LONG previous = lastTick;
+	if (previous != 0 && (now - previous) < 2000) return;
+	InterlockedExchange(&lastTick, now);
+
+	ShutdownNotice* notice = new (std::nothrow) ShutdownNotice();
+	if (!notice) return;
+	notice->api = api ? api : L"unknown";
+	HANDLE thread = CreateThread(NULL, 0, VShutdownNoticeThread, notice, 0, NULL);
+	if (thread) CloseHandle(thread);
+	else delete notice;
+}
+
 void VManualQuit()
 {
 	VCloseFuckDrivers();
@@ -2562,6 +3423,23 @@ void VInstallHooks(VirusMode mode) {
 	faWinExec = (fnWinExec)GetProcAddress(hKernel32, "WinExec");
 
 	faExitWindowsEx = (fnExitWindowsEx)GetProcAddress(hUser32, "ExitWindowsEx");
+
+	// 关机拦截的其余入口。advapi32 的四个必有；ntdll 的三个按导出情况装
+	// （NtShutdownSystem 在部分版本上是空实现，能拿到地址就装，挡不到也无害）。
+	HMODULE hAdvApi32 = GetModuleHandleW(L"advapi32.dll");
+	if (!hAdvApi32) hAdvApi32 = LoadLibraryW(L"advapi32.dll");
+	if (hAdvApi32) {
+		faInitiateSystemShutdownExW = (fnInitiateSystemShutdownExW)GetProcAddress(hAdvApi32, "InitiateSystemShutdownExW");
+		faInitiateSystemShutdownExA = (fnInitiateSystemShutdownExA)GetProcAddress(hAdvApi32, "InitiateSystemShutdownExA");
+		faInitiateSystemShutdownW = (fnInitiateSystemShutdownW)GetProcAddress(hAdvApi32, "InitiateSystemShutdownW");
+		faInitiateSystemShutdownA = (fnInitiateSystemShutdownA)GetProcAddress(hAdvApi32, "InitiateSystemShutdownA");
+	}
+	HMODULE hNtDll = GetModuleHandleW(L"ntdll.dll");
+	if (hNtDll) {
+		faNtShutdownSystem = (fnNtShutdownSystem)GetProcAddress(hNtDll, "NtShutdownSystem");
+		faNtSetSystemPowerState = (fnNtSetSystemPowerState)GetProcAddress(hNtDll, "NtSetSystemPowerState");
+		faNtInitiatePowerAction = (fnNtInitiatePowerAction)GetProcAddress(hNtDll, "NtInitiatePowerAction");
+	}
 	//faShellExecuteW = (fnShellExecuteW)GetProcAddress(hShell32, "ShellExecuteW");
 	//faShellExecuteExW = (fnShellExecuteExW)GetProcAddress(hShell32, "ShellExecuteExW");
 
@@ -2674,7 +3552,12 @@ void VInstallHooks(VirusMode mode) {
 		// 按 PlanForCapture 决定透传还是替换，开关关着时只写一条 RECORD 日志。
 		// minimal 模式连显示域都跳过了，装 BitBlt 会让「minimal 不碰显示」这条承诺失效，
 		// 所以只在 full 模式下补。
-		if (g_customHost && g_VideoProps.m_EnableModifyVideoStream && !g_customHookMinimal)
+		//
+		// 电子教室宿主在「禁止教师看屏」时也要装 BitBlt：它们的抓屏就是裸 BitBlt，
+		// 假桌面只能拦住 GetDesktopWindow / CreateDCW 这两条，GetDC(NULL) 拦不住。
+		const bool needFrameHooks = g_VideoProps.m_EnableModifyVideoStream
+			|| (g_eduHost && whitePreviewOnly);
+		if (g_customHost && needFrameHooks && !g_customHookMinimal)
 			VEnsureFrameReplacementHooks();
 
 		VDebugLog(L"VInstallHooks end mode=hook hk28=%d installed=%d window=%d process=%d input=%d display=%d",
@@ -2718,8 +3601,11 @@ static void VEnsureFrameReplacementHooks()
 			hk23 = VSetHookLogged(L"DwmEnableComposition", (PVOID*)&faDwmEnableComposition, (PVOID)hkDwmEnableComposition);
 	}
 
-	// 视频流替换：帧替换钩子
-	if (g_VideoProps.m_EnableModifyVideoStream && fpBitBlt && !hk41)
+	// 视频流替换：帧替换钩子。
+	// 电子教室宿主在挡屏时同样需要 BitBlt —— 见 Hook_BitBlt 开头的说明。
+	const bool needBitBlt = g_VideoProps.m_EnableModifyVideoStream
+		|| (g_eduHost && whitePreviewOnly);
+	if (needBitBlt && fpBitBlt && !hk41)
 		hk41 = VSetHookLogged(L"BitBlt(video-modify)", (PVOID*)&fpBitBlt, (PVOID)Hook_BitBlt);
 }
 
@@ -2809,13 +3695,7 @@ void VUnInstallHooks() {
 	g_frames.Shutdown();
 	if (g_VideoCsInit) { DeleteCriticalSection(&g_VideoCs); g_VideoCsInit = false; }
 	// 释放全部 trampoline。必须放在上面所有仍可能调进钩子的清理动作之后。
-	// 有 detour 没归零时绝不能释放：那些线程返回后会跳到已释放的 trampoline。
-	if (!drained) {
-		VOutPutStatus(L"[E] detours still in flight; trampolines intentionally leaked");
-	}
-	else {
-		HookEngine::Uninitialize();
-	}
+	HookEngine::Uninitialize();
 
 	VOutPutStatus(L"[D] UnInstall all hook");
 
@@ -3056,20 +3936,40 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		SetTimer(hDlg, TIMER_WATCH_DOG_SRV, 6666, NULL);
 		SetTimer(hDlg, TIMER_AUTO_HIDE, 2600, NULL);
 		SetTimer(hDlg, TIMER_UI_HEARTBEAT, 10000, NULL);
-		// 通用宿主只把消息中心当消息泵用，不显示状态窗口/假桌面，
-		// 避免在用户指定的进程里凭空冒出一个窗口。
+		// 状态窗口在任何宿主里都不显示，避免在用户指定的进程里凭空冒出一个窗口。
+		// 假桌面不同：它在 (-screenWidth, -screenHeight) 的屏幕外，用户看不到，
+		// 但 hk26/27/33 需要一个真窗口的 DC 才能给出空白画面 —— 电子教室宿主
+		// 在「禁止教师看屏」时必须把它 show 出来，否则拦回来的是个空 DC。
+		if (g_eduHost && whitePreviewOnly) {
+			ShowWindow(fakeDesktopWindow, SW_SHOW);
+			UpdateWindow(fakeDesktopWindow);
+		}
 		if (!g_customHost) {
 			ShowWindow(fakeDesktopWindow, SW_SHOW);
 			UpdateWindow(fakeDesktopWindow);
 			ShowWindow(hDlg, SW_SHOW);
 			UpdateWindow(hDlg);
 		}
-		VDebugLog(L"MainWndProc initialization completed customHost=%d windowShown=%d",
-			g_customHost, !g_customHost);
+		// 注入常常发生在宿主已经全屏之后，此时一次窗口钩子都没走过，
+		// 右键菜单只能靠这次补挂。
+		if (g_customHost) VAttachEduWindows();
+		// 菜单挂完再开巡查：补挂那一步会把「本来就全屏」的窗口记成允许，
+		// 否则头一趟巡查就会拿它开刀。
+		if (g_customHost && askWindowOps) {
+			SetTimer(hDlg, TIMER_EDU_SWEEP, 300, NULL);
+			// 主日志里留一行，确认跑的是带询问的这版 DLL。
+			VEduOpNotice(L"active", NULL);
+		}
+		VDebugLog(L"MainWndProc initialization completed customHost=%d eduHost=%d whitePreviewOnly=%d",
+			g_customHost, g_eduHost, whitePreviewOnly);
 		return TRUE;
 	}
 	case WM_INITDIALOG: {
-		SetWindowText(hDlg, L"JiYu Trainer Virus Window");
+		// 主程序靠这个标题找极域学生端的消息中心（MsgCenterSendToVirus 的
+		// FindWindow）。注入的第三方进程如果也叫这个名字，hk: 命令会投给
+		// 错误的进程 —— 极域那边收不到 reset/setmonitor，这里又当成正常输入。
+		SetWindowText(hDlg, g_customHost ? EDZU_CUSTOM_HOST_WINDOW_TITLE
+		                                 : L"JiYu Trainer Virus Window");
 		HWND statusList = GetDlgItem(hDlg, IDC_STATUS_LIST);
 		if (statusList)
 			DestroyWindow(statusList);
@@ -3238,17 +4138,17 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		VDebugLog(L"WM_COPYDATA end elapsedMs=%llu", GetTickCount64() - started);
 		break;
 	}
+	case WM_DZJS_ASK_WINDOWOP: {
+		// 钩子只投递，不等待。这里弹完框、按答复重放，极域那边早就继续跑了。
+		VAskWindowOp();
+		return TRUE;
+	}
 	case WM_STATUS_APPEND: {
-		// 指针是本进程堆上的对象：只接受带握手值、且来自本进程的消息，
-		// 否则外部进程 SendMessage 一个地址过来就会被 delete[] 掉。
-		DWORD senderPid = 0;
-		GetWindowThreadProcessId(hDlg, &senderPid);
 		wchar_t* status = reinterpret_cast<wchar_t*>(lParam);
-		if (wParam == WM_STATUS_APPEND_MAGIC && senderPid == GetCurrentProcessId() && status) {
-			VDebugLog(L"WM_STATUS_APPEND begin text=%s", status);
+		VDebugLog(L"WM_STATUS_APPEND begin text=%s", status ? status : L"(null)");
+		if (status)
 			VAppendStatusLine(status);
-			delete[] status;
-		}
+		delete[] status;
 		VDebugLog(L"WM_STATUS_APPEND end");
 		return TRUE;
 	}
@@ -3288,6 +4188,8 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		if (wParam == TIMER_UI_HEARTBEAT)
 			VDebugLog(L"UI heartbeat hwnd=%p visible=%d watchdogRunning=%ld", hDlg, IsWindowVisible(hDlg), watchdogRunning);
+		if (wParam == TIMER_EDU_SWEEP)
+			VEduSweepWindowOps();
 		if (wParam == TIMER_LIGNT_DELAY1) {
 			KillTimer(hDlg, TIMER_LIGNT_DELAY1);
 			SendMessage(hDlg, WM_COMMAND, IDC_SW_STATUS_MAIN, NULL);
@@ -3307,6 +4209,30 @@ INT_PTR CALLBACK MainWndProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 	}
 	return 0;
 }
+// 窗口当前是否铺满整屏。用 >= 而不是 ==：多屏拼接、DPI 取整都可能多出一两个像素。
+bool VWindowIsFullScreen(HWND hWnd)
+{
+	if (!hWnd || !IsWindow(hWnd)) return false;
+	RECT rc;
+	if (!GetWindowRect(hWnd, &rc)) return false;
+	return rc.left <= 0 && rc.top <= 0 &&
+		(rc.right - rc.left) >= screenWidth &&
+		(rc.bottom - rc.top) >= screenHeight;
+}
+
+// 弹出前按当前状态刷新文案与勾选。菜单是全局共用的，不能只在创建时写死。
+void VUpdateGbMenu(HWND hWnd)
+{
+	if (!hMenuGb) return;
+	const bool top = (GetWindowLongW(hWnd, GWL_EXSTYLE) & WS_EX_TOPMOST) == WS_EX_TOPMOST;
+	ModifyMenuW(hMenuGb, IDM_FULL, MF_BYCOMMAND | MF_STRING, IDM_FULL,
+		gbFullManual ? L"退出全屏" : L"全屏显示");
+	ModifyMenuW(hMenuGb, IDM_TOPMOST, MF_BYCOMMAND | MF_STRING, IDM_TOPMOST,
+		top ? L"取消置顶" : L"窗口置顶");
+	CheckMenuItem(hMenuGb, IDM_FULL, MF_BYCOMMAND | (gbFullManual ? MF_CHECKED : MF_UNCHECKED));
+	CheckMenuItem(hMenuGb, IDM_TOPMOST, MF_BYCOMMAND | (top ? MF_CHECKED : MF_UNCHECKED));
+}
+
 INT_PTR CALLBACK JiYuWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
 	/*
 	if (message == WM_TIMER) {
@@ -3378,6 +4304,7 @@ INT_PTR CALLBACK JiYuWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 	{
 		{ VWndListGuard guard; jiYuWnds.remove(hWnd); }
 		{ VWndListGuard guard; jiYuWndCanSize.remove(hWnd); }
+		VForgetWindowOp(hWnd);
 		VSwitchLockState(false);
 		isGbFounded = false;
 	}
@@ -3392,6 +4319,12 @@ INT_PTR CALLBACK JiYuWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 		}
 		case IDM_HELP_GB2: {
 			VSendMessageBack(L"hkb:showhelp", hWndMsgCenter);
+			return 0;
+		}
+		case IDM_ALLOW_OPS: {
+			// 用户主动放行：改掉决定，并把上一次被挡的那次操作补上。
+			// 不补的话，极域要等到下次广播才生效，看起来像点了没反应。
+			VGrantWindowOps(hWnd);
 			return 0;
 		}
 		case IDM_CLOSE_GB: return SendMessage(hWnd, WM_SYSCOMMAND, SC_CLOSE, NULL);
@@ -3470,12 +4403,16 @@ INT_PTR CALLBACK JiYuWndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lPar
 		pos.x = GET_X_LPARAM(lParam);
 		pos.y = GET_Y_LPARAM(lParam);
 
-		if (jiYuVersion == jiYuVersions::jiYuVersions40 && (pos.x > 60 || pos.y > 20)) 
+		// 全屏时整块画面都是广播内容，右键任意位置都给出菜单。
+		// 窗口化时保留原来的规矩：4.0 只在左上角弹，其余位置让给极域自己的菜单。
+		if (!VWindowIsFullScreen(hWnd) && jiYuVersion == jiYuVersions::jiYuVersions40
+			&& (pos.x > 60 || pos.y > 20))
 			showMenu = false;
 		if (showMenu) {
+			VUpdateGbMenu(hWnd);
 			ClientToScreen(hWnd, &pos);
 			int id = TrackPopupMenu(hMenuGb, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, pos.x + 10, pos.y + 10, NULL, hWnd, NULL);
-			SendMessage(hWnd, WM_COMMAND, id, NULL);
+			if (id) SendMessage(hWnd, WM_COMMAND, id, NULL);
 		}
 	}
 JOUT:
@@ -3744,9 +4681,12 @@ BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
 
 	// 快速路径:未启用视频流修改,或正在卸载 —— 纯透传,不做任何额外 GDI 调用,
 	// 把对进程内其它 BitBlt(UI 绘制等)的影响降到最低,避免无谓开销与潜在卡死。
-	// 当前仓库从未调用 VSetVideoStreamModify 提供替换帧,因此外部替换画面恒为空,
-	// 走的就是这条快速路径:钩子存在但行为等同透传,绝不会卡死。
-	if (g_Unloading || !g_VideoProps.m_EnableModifyVideoStream)
+	//
+	// 电子教室宿主是例外:「禁止教师看屏」时它们的抓屏就是裸 BitBlt（没有极域
+	// 那套 LibDeskMonitor/DispFilter 可钩），只拦 DC 会让教师看到真实画面。
+	// 拦截范围由下面的 IsScreenCaptureInto 限定在「屏幕 → 内存」，不影响 UI 绘制。
+	const bool eduScreenBlock = g_eduHost && !allowMonitor;
+	if (g_Unloading || (!g_VideoProps.m_EnableModifyVideoStream && !eduScreenBlock))
 		return fpBitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);
 
 	// 视频流修改:两种模式
@@ -3802,24 +4742,35 @@ BOOL WINAPI Hook_BitBlt(HDC hdc, int x, int y, int cx, int cy,
 	if (replacement)
 		result = fpBitBlt(hdc, x, y, cx, cy, replacement, x1, y1, rop);
 	else if (blackFill) {
-		if (GetObjectType(hdc) == OBJ_MEMDC && GetObjectType(hdcSrc) == OBJ_DC &&
-		    VIsScreenCopyRop(rop)) {
-			tlsCaptureBackingDC = hdc;
-			tlsCapturePending = true;
-			tlsCaptureX = x;
-			tlsCaptureY = y;
-			tlsCaptureWidth = cx;
-			tlsCaptureHeight = cy;
+		// 只有电子教室宿主走白屏：极域那条线的 blackFill 分支原来画的是
+		// 「黑 / 替换图」，改颜色属于行为变更，不能顺手统一。
+		if (g_eduHost && !allowMonitor) {
+			result = PatBlt(hdc, x, y, cx, cy, WHITENESS);
+			static volatile LONG s_eduBlockLogCount = 0;
+			if (InterlockedIncrement(&s_eduBlockLogCount) <= 20)
+				VDebugLog(L"Hook_BitBlt block-monitor whiteFill cx=%d cy=%d srcDC=%p dstDC=%p result=%d",
+				          cx, cy, hdcSrc, hdc, (int)result);
 		}
-		LONG bitmapWidth = 0, bitmapHeight = 0;
-		bool usedCustomImage = false;
-		result = VRenderSelectedCaptureBitmap(hdc, x, y, cx, cy, &bitmapWidth, &bitmapHeight, &usedCustomImage);
-		static volatile LONG s_backingBitmapLogCount = 0;
-		LONG logIndex = InterlockedIncrement(&s_backingBitmapLogCount);
-		if (logIndex <= 40 || (logIndex % 2000 == 0))
-			VDebugLog(L"Hook_BitBlt backing bitmap rendered mode=%s bitmapW=%d bitmapH=%d dirtyX=%d dirtyY=%d dirtyW=%d dirtyH=%d srcDC=%p dstDC=%p result=%d",
-			          usedCustomImage ? L"image" : L"black", bitmapWidth, bitmapHeight,
-			          x, y, cx, cy, hdcSrc, hdc, (int)result);
+		else {
+			if (GetObjectType(hdc) == OBJ_MEMDC && GetObjectType(hdcSrc) == OBJ_DC &&
+			    VIsScreenCopyRop(rop)) {
+				tlsCaptureBackingDC = hdc;
+				tlsCapturePending = true;
+				tlsCaptureX = x;
+				tlsCaptureY = y;
+				tlsCaptureWidth = cx;
+				tlsCaptureHeight = cy;
+			}
+			LONG bitmapWidth = 0, bitmapHeight = 0;
+			bool usedCustomImage = false;
+			result = VRenderSelectedCaptureBitmap(hdc, x, y, cx, cy, &bitmapWidth, &bitmapHeight, &usedCustomImage);
+			static volatile LONG s_backingBitmapLogCount = 0;
+			LONG logIndex = InterlockedIncrement(&s_backingBitmapLogCount);
+			if (logIndex <= 40 || (logIndex % 2000 == 0))
+				VDebugLog(L"Hook_BitBlt backing bitmap rendered mode=%s bitmapW=%d bitmapH=%d dirtyX=%d dirtyY=%d dirtyW=%d dirtyH=%d srcDC=%p dstDC=%p result=%d",
+				          usedCustomImage ? L"image" : L"black", bitmapWidth, bitmapHeight,
+				          x, y, cx, cy, hdcSrc, hdc, (int)result);
+		}
 	}
 	else
 		result = fpBitBlt(hdc, x, y, cx, cy, hdcSrc, x1, y1, rop);

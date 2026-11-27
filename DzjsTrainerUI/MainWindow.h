@@ -48,12 +48,14 @@ public:
 
 	void OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD pid, bool byuser) override;
 	void OnUpdateState(TrainerStatus status, LPCWSTR textMain, LPCWSTR textMore) override;
+	void OnUpdateEduHosts(int count, LPCWSTR summary) override;
 	void OnResolveBlackScreenWindow() override;
 	void OnBeforeSendStartConf() override;
 	HWND GetMainHWND() override { return _hWnd; }
 	void OnSimpleMessageCallback(LPCWSTR text) override;
 	void OnAllowGbTop() override;
 	void OnShowHelp() override;
+	void OnShutdownBlocked(LPCWSTR api) override;
 
 private:
 	struct TeacherBackend;
@@ -99,6 +101,15 @@ private:
 	};
 
 	HWND _hWnd = nullptr;
+	// 自绘、命中测试、布局都按 96 DPI 的逻辑坐标写；物理像素只出现在三处：
+	// 后备位图尺寸、BitBlt、原生子窗口的 HWND 位置。uiScale = 当前 DPI / 96，
+	// Per-Monitor V2 下窗口被拖到另一块屏时会变。
+	float uiScale = 1.0f;
+	void ApplyDpiChange(int dpi, const RECT* suggested);
+	void PointToLogical(POINT& point) const;
+	void RebuildControlFont();
+	int ToPhysical(int logical) const { return static_cast<int>(lround(static_cast<double>(logical) * uiScale)); }
+	int ToLogical(int physical) const { return static_cast<int>(lround(static_cast<double>(physical) / uiScale)); }
 	ULONG_PTR gdiplusToken = 0;
 	Gdiplus::Bitmap* backBuffer = nullptr;
 	int backBufferWidth = 0;
@@ -140,6 +151,9 @@ private:
 	HBRUSH advancedFieldBrush = nullptr;
 	// 进程选择器的搜索框是原生 EDIT，底色同样要和自绘的圆角框对齐。
 	HBRUSH processPickerFieldBrush = nullptr;
+	// 反馈弹窗里三个 EDIT 的方底色。必须和自绘圆角框的填充同色，
+	// 否则圆角里会露出一个颜色略深的方块。
+	HBRUSH feedbackFieldBrush = nullptr;
 	HWND processPickerSearchEdit = nullptr;
 	WNDPROC processPickerSearchEditProc = nullptr;
 	std::array<HWND, 15> networkControls{};
@@ -149,6 +163,8 @@ private:
 	DWORD teacherProcessId = 0;
 	HWND teacherChildWindow = nullptr;
 	bool teacherLaunchPending = false;
+	// 没等到 FLTK 窗口时不再杀进程，而是让教师端以自己的窗口独立运行。
+	bool teacherStandalone = false;
 	ULONGLONG teacherLaunchDeadline = 0;
 	HWND teacherRefreshButton = nullptr;
 	HWND teacherViewButton = nullptr;
@@ -199,6 +215,12 @@ private:
 	std::array<RECT, 3> customInjectRects{};
 	std::wstring customInjectStatus = L"\u5c31\u7eea";
 	std::wstring customInjectList;
+	// 「自动接管其他电子教室」开关：以前只能改 ini，界面上要能看到、能关掉。
+	RECT eduCompatToggleRect{};
+	bool eduCompatAutoInject = true;
+	// 其他电子教室宿主的现状，由 OnUpdateEduHosts 推过来，概览页和注入页共用。
+	int eduHostCount = 0;
+	std::wstring eduHostSummary;
 
 	// 进程选择弹窗：和更新弹窗共用一套窗口内自绘模态卡片，不再弹原生对话框。
 	// 原生 STATIC/EDIT/BUTTON 是直角灰底 + 系统标题栏，和这套圆角玻璃界面两套皮。
@@ -262,7 +284,8 @@ private:
 	int pressTarget = -1;
 	// 交互元素比早期多得多（导航 10 + 页面按钮 + 诊断列表行），留够槽位。
 	// 原来 80 个槽，restoreTeacherView(81) 和 superTopMost(80) 已经越界。
-	std::array<float, 128> hoverProgress{};
+	// 弹窗越来越多，槽位跟着扩；索引不做边界检查，加 id 时记得同步这里。
+	std::array<float, 144> hoverProgress{};
 	// 开关滑块的插值位置（0=关，1=开）。防护策略 7 个、高级配置 6 个，
 	// 两页分槽（0-7 / 8-15），否则翻页时滑块会串味。
 	std::array<float, 24> toggleMotion{};
@@ -290,10 +313,15 @@ private:
 	bool firstShow = true;
 	bool isUserCancel = false;
 	bool closeButtonClickPending = false;
+	// 电源菜单里的关机/重启会先把这一位立起来 —— 只有自己发起的关机才放行，
+	// 别的进程（电子教室、关机脚本）来的请求一律拦下。
+	bool allowShutdown = false;
 	bool mouseTracking = false;
 	bool hideTipShowed = false;
 	bool setTopMost = false;
 	bool topMostUiAccessBand = false;
+	// 普通置顶的 50ms 重设循环是否在跑。超级置顶不需要它。
+	bool topmostKeepTimerRunning = false;
 	bool studentRunning = false;
 	bool currentControlled = false;
 	DWORD studentPid = 0;
@@ -364,6 +392,7 @@ private:
 	RECT advancedSaveRect{};
 	RECT networkProjectRect{};
 	RECT aboutUpdateRect{};
+	RECT aboutFeedbackRect{};
 	RECT aboutExitRect{};
 	HWND aboutExitButton = nullptr;
 	RECT teacherLaunchRect{};
@@ -453,7 +482,57 @@ private:
 	RECT updateDialogPrimaryRect{};
 	RECT updateDialogSecondaryRect{};
 	bool UpdateDialogVisible() const { return updateDialog.mode != UpdateDialogMode::None; }
-	bool ModalDialogVisible() const { return UpdateDialogVisible() || ProcessPickerVisible(); }
+	// 「防护状态」快捷卡点开的信息面板。内容在打开那一刻采一次快照 ——
+	// 用户是来看"现在是什么情况"的，不是来看数字在眼前变来变去的。
+	struct ProtectInfoRow {
+		std::wstring label;
+		std::wstring value;
+	};
+	bool protectDialogVisible = false;
+	float protectDialogAppear = 0.0f;
+	std::wstring protectHeadline;
+	std::wstring protectSummary;
+	std::vector<ProtectInfoRow> protectRows;
+	RECT protectDialogCloseRect{};
+	bool ProtectDialogVisible() const { return protectDialogVisible; }
+	bool ModalDialogVisible() const {
+		return UpdateDialogVisible() || ProcessPickerVisible() || ProtectDialogVisible() ||
+			FeedbackDialogVisible();
+	}
+	void PaintProtectDialog(Gdiplus::Graphics& g, int width, int height);
+	void OpenProtectDialog();
+	void CloseProtectDialog();
+	int HitProtectDialogAt(POINT point) const;
+	bool HandleProtectDialogClick(POINT point);
+	// 「意见反馈」：自绘卡片 + 三个原生 EDIT。描述和复现步骤都必填 ——
+	// 只有一句"用不了"的反馈，没有上下文也没法查。
+	bool feedbackDialogVisible = false;
+	float feedbackDialogAppear = 0.0f;
+	bool feedbackSubmitting = false;
+	bool feedbackSubmitFailed = false;
+	std::wstring feedbackStatus;
+	HWND feedbackDescEdit = nullptr;
+	HWND feedbackReproEdit = nullptr;
+	HWND feedbackContactEdit = nullptr;
+	WNDPROC feedbackEditProc = nullptr;
+	RECT feedbackDescRect{};
+	RECT feedbackReproRect{};
+	RECT feedbackContactRect{};
+	RECT feedbackCancelRect{};
+	RECT feedbackSubmitRect{};
+	bool FeedbackDialogVisible() const { return feedbackDialogVisible; }
+	void PaintFeedbackDialog(Gdiplus::Graphics& g, int width, int height);
+	void OpenFeedbackDialog();
+	void CloseFeedbackDialog();
+	void EnsureFeedbackEdits();
+	void PositionFeedbackEdits();
+	void SubmitFeedback();
+	std::wstring BuildFeedbackSystemInfo();
+	void OnFeedbackSubmitted();
+	int HitFeedbackDialogAt(POINT point) const;
+	bool HandleFeedbackDialogClick(POINT point);
+	void CycleFeedbackFocus(int from, int step);
+	static LRESULT CALLBACK FeedbackEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
 	// 一次探测还没回来时不再起第二次。两次并行探测会各弹一次结果，谁先到不确定；
 	// 用户看到的就是「点了没动静，再点一下突然说已是最新版本」。
 	std::atomic<bool> updateProbeInFlight{ false };
@@ -468,6 +547,7 @@ private:
 	// 弹窗期间要先把它们藏起来，关掉后再按页面状态恢复。
 	void ApplyDialogOcclusion();
 	void RequestSuperTopmost();
+	void SyncTopmostKeepTimer();
 	void SelectPage(Page target);
 	void PaintInjection(Gdiplus::Graphics& g, int width, int height, int offsetY);
 	// 自绘进程选择器
@@ -503,6 +583,7 @@ private:
 	void StopEmbeddedTeacherGui();
 	void PollEmbeddedTeacherGui();
 	bool AttachEmbeddedTeacherGui();
+	void EnterStandaloneTeacherGui();
 	void LayoutEmbeddedTeacherGui();
 	void StartTeacherService();
 	void StopTeacherService();
@@ -520,6 +601,8 @@ private:
 	void UnloadSelectedDiagnosticDriver();
 	void AppendNetworkResult(LPCWSTR text);
 	void ShowPowerMenu();
+	// 概览页「结束电子教室」：弹出当前在跑的教室列表，按选中的那条结束。
+	void ShowEduMenu();
 	void ShowHelp();
 	void ExportLogs();
 	void ApplyTemporaryVideoProtection();

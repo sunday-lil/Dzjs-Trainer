@@ -12,12 +12,93 @@
 #include "../DzjsTrainerUpdater/DzjsTrainerUpdater.h"
 #include "../DzjsTrainerUpdater/UpdaterIpc.h"
 #include "../DzjsTrainer/AppPublic.h"
+#include "../DzjsTrainer/EduProducts.h"
 
 // 窗口默认从抓屏里排除（防极域/录屏）。排查 UI 视觉效果期间临时关掉，
 // 这样截图工具能拍到真实界面；视觉调整完成后改回 1 即可恢复。
 #ifndef DZJS_ENABLE_CAPTURE_EXCLUSION
 #define DZJS_ENABLE_CAPTURE_EXCLUSION 1
 #endif
+
+// 进程 DPI 感知由 exe 清单声明为 Per-Monitor V2。GetDpiForWindow 是 1607 才有的
+// 导出，静态导入会让程序在更早的系统上启动就报缺导入，所以按需取。
+UINT QueryWindowDpi(HWND window)
+{
+	typedef UINT(WINAPI* GetDpiForWindowFn)(HWND);
+	static GetDpiForWindowFn getDpiForWindow = reinterpret_cast<GetDpiForWindowFn>(
+		GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+	if (getDpiForWindow != nullptr) {
+		const UINT dpi = getDpiForWindow(window);
+		if (dpi != 0) return dpi;
+	}
+	HDC dc = GetDC(window);
+	if (dc == nullptr) return 96;
+	const int dpi = GetDeviceCaps(dc, LOGPIXELSX);
+	ReleaseDC(window, dc);
+	return dpi > 0 ? static_cast<UINT>(dpi) : 96;
+}
+
+// 辅助窗口（输入提示、退出确认、三个选择器）要么堆原生控件，要么是固定像素的
+// 自绘布局，都没有主窗口那套逻辑坐标系。这里按窗口所在监视器的 DPI 把 96 DPI
+// 下写的数值换一遍：布局本身一个数不改，只换单位。
+int AuxPx(HWND window, int value)
+{
+	return MulDiv(value, static_cast<int>(QueryWindowDpi(window)), 96);
+}
+
+float AuxScale(HWND window)
+{
+	return static_cast<float>(QueryWindowDpi(window)) / 96.0f;
+}
+
+// 原生控件的默认字体是 96 DPI 的位图字体，Per-Monitor 感知的进程里它不会自己
+// 变大 —— 高 DPI 下这些窗口看起来就是「整块缩水」，原因一半在字体。取目标
+// DPI 的 message font：100% 下和默认外观完全一致，高 DPI 下才是系统本来会给的那一档。
+HFONT CreateAuxUiFont(HWND window)
+{
+	NONCLIENTMETRICSW metrics = {};
+	metrics.cbSize = sizeof(metrics);
+	typedef BOOL(WINAPI* ForDpiFn)(UINT, UINT, PVOID, UINT, UINT);
+	static ForDpiFn forDpi = reinterpret_cast<ForDpiFn>(
+		GetProcAddress(GetModuleHandleW(L"user32.dll"), "SystemParametersInfoForDpi"));
+	BOOL ok = FALSE;
+	if (forDpi != nullptr)
+		ok = forDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, QueryWindowDpi(window));
+	if (!ok) SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0);
+	return CreateFontIndirectW(&metrics.lfMessageFont);
+}
+
+void ApplyAuxFont(HWND parent, HFONT font)
+{
+	if (!font) return;
+	EnumChildWindows(parent, [](HWND child, LPARAM value) -> BOOL {
+		SendMessageW(child, WM_SETFONT, static_cast<WPARAM>(value), TRUE);
+		return TRUE;
+	}, reinterpret_cast<LPARAM>(font));
+}
+
+// 弹窗按「属主所在那块屏」的可用区域居中。SPI_GETWORKAREA 只给主显示器，
+// 主窗口搬到副屏之后这些弹窗会跑到另一块屏上去。
+RECT AuxWorkArea(HWND owner)
+{
+	MONITORINFO info = {};
+	info.cbSize = sizeof(info);
+	HMONITOR monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+	if (monitor && GetMonitorInfoW(monitor, &info)) return info.rcWork;
+	RECT area = {};
+	SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
+	return area;
+}
+
+// 居中到属主那块屏。width / height 是已经换算过的物理像素尺寸。
+POINT AuxCenterOn(HWND owner, int width, int height)
+{
+	const RECT area = AuxWorkArea(owner);
+	POINT point{};
+	point.x = area.left + ((area.right - area.left) - width) / 2;
+	point.y = area.top + ((area.bottom - area.top) - height) / 2;
+	return point;
+}
 
 // 进程图标缓存定义在后面的「进程选择器」一节，析构路径上要先用到。
 void ClearProcessIconCache();
@@ -170,6 +251,11 @@ constexpr UINT WM_AV_SCAN_FINISHED = WM_APP + 43;
 constexpr UINT WM_UPDATE_PROBE_DONE = WM_APP + 44;
 // 内置更新的下载进度/结果回到 UI 线程用。
 constexpr UINT WM_UPDATE_DOWNLOAD_STATE = WM_APP + 45;
+// 关机请求被拦下之后，回到 UI 线程再去弹提示（WM_QUERYENDSESSION 里不能慢）。
+// 47 而不是 46：WM_APP+46 被 UpdaterIpc.h 的下载进度占了。
+constexpr UINT WM_MY_SHUTDOWN_BLOCKED = WM_APP + 47;
+// 反馈上传线程收工后回到 UI 线程。
+constexpr UINT WM_MY_FEEDBACK_DONE = WM_APP + 48;
 
 struct UpdateDownloadContext {
 	HWND window = nullptr;
@@ -198,6 +284,17 @@ constexpr int kProcessPickerRefresh = 124;
 constexpr int kProcessPickerSelectAll = 125;
 // 搜索框的控件 ID。它不是自绘的按钮，只用来收 IDC 和 WM_CTLCOLOR 分支。
 constexpr int kProcessPickerSearch = 126;
+// 「防护状态」信息面板只有一颗关闭按钮，占 hoverProgress 的最后一格。
+constexpr int kProtectDialogClose = 127;
+// 「意见反馈」的两颗按钮，以及三个原生 EDIT 的控件 ID。EDIT 只用来收
+// WM_CTLCOLOR 和键盘消息，不参与布局 —— 位置由 PositionFeedbackEdits 摆。
+constexpr int kFeedbackCancel = 128;
+constexpr int kFeedbackSubmit = 129;
+// 关于页「意见反馈」那颗按钮。它不进弹窗，但要有 id 才能吃悬停态和 Tab 焦点。
+constexpr int kAboutFeedback = 130;
+constexpr int kFeedbackDescEdit = 47001;
+constexpr int kFeedbackReproEdit = 47002;
+constexpr int kFeedbackContactEdit = 47003;
 constexpr int kProcessPickerMaxRows = 14;
 
 std::wstring FormatByteSize(unsigned long long bytes)
@@ -627,15 +724,27 @@ constexpr UINT WM_COPYGLOBALDATA_COMPAT = 0x0049;
 constexpr UINT TIMER_ANIMATION = 20;
 // 服务轮询和动画分开：轮询 5 次/秒足够，动画只在有东西在动时才跑 60 帧。
 constexpr UINT TIMER_SERVICE_POLL = 23;
-constexpr UINT TIMER_TRAY_REPAIR = 21;
-// 21 已被 TIMER_TRAY_REPAIR 占用；两者共用会让托盘修复顺带触发一次 1 号操作。
-constexpr UINT TIMER_RERUN = 25;
+// 托盘修复原来和 TIMER_RERUN 都写了 21：SetTimer 互相顶掉，WM_TIMER 里先命中的
+// 是 TIMER_RERUN 分支，修复分支永远走不到；更糟的是首次显示排的 2 秒修复会在
+// 两秒后当成「重跑」调用一次 RunOperation。这里独占一个号。
+constexpr UINT TIMER_TRAY_REPAIR = 25;
+constexpr UINT TIMER_RERUN = 21;
 constexpr UINT TIMER_AUTO_SHUT = 22;
 // 更新替换完成后停一下再退出，让「更新完成」这一帧留得住。
 constexpr UINT TIMER_UPDATE_RESTART = 24;
+// 普通置顶靠每 50ms 重设一次 HWND_TOPMOST 压住别的 topmost 窗口；超级置顶
+// 走 UIAccess 窗口带，用不上这个循环，切换时就把定时器停掉。
+constexpr UINT TIMER_TOPMOST_KEEP = 26;
 constexpr int CMD_POWER_SHUTDOWN = 41001;
 constexpr int CMD_POWER_RESTART = 41002;
 constexpr int CMD_POWER_EXIT = 41003;
+// 「结束电子教室」的弹菜单：极域一条、每个产品一条（+100 偏移），最后是全部。
+constexpr int CMD_END_JIYU = 41010;
+constexpr int CMD_END_EDU_BASE = 41100;
+constexpr int CMD_END_ALL = 41011;
+// 启动那一半。极域走 Rerun()，其他教室按产品名走 StartEduHost()。
+constexpr int CMD_START_JIYU = 41012;
+constexpr int CMD_START_EDU_BASE = 41200;
 constexpr int IDC_NET_IP = 42001;
 constexpr int IDC_NET_PORT = 42002;
 constexpr int IDC_NET_MESSAGE = 42003;
@@ -667,7 +776,6 @@ constexpr int IDC_AV_PROCESS_LIST = 45101;
 constexpr int IDC_AV_PROCESS_REFRESH = 45102;
 constexpr int IDC_AV_PROCESS_OK = 45103;
 constexpr int IDC_AV_PROCESS_CANCEL = 45104;
-constexpr int IDC_EXIT_CONFIRM_EDIT = 46001;
 constexpr int IDC_EXIT_CONFIRM_OK = 46002;
 constexpr int IDC_EXIT_CONFIRM_CANCEL = 46003;
 
@@ -1164,6 +1272,7 @@ struct AvTextPromptContext {
 	HWND owner = nullptr;
 	HWND window = nullptr;
 	HWND edit = nullptr;
+	HFONT font = nullptr;
 	std::wstring title;
 	std::wstring prompt;
 	std::wstring value;
@@ -1183,19 +1292,27 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE:
+		context->font = CreateAuxUiFont(window);
 		CreateWindowExW(0, L"STATIC", context->prompt.c_str(), WS_CHILD | WS_VISIBLE,
-			18, 16, 444, 28, window, nullptr, GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 18), AuxPx(window, 16), AuxPx(window, 444), AuxPx(window, 28),
+			window, nullptr, GetModuleHandleW(nullptr), nullptr);
 		context->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", context->value.c_str(),
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
-			18, 50, 444, 170, window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_EDIT), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 18), AuxPx(window, 50), AuxPx(window, 444), AuxPx(window, 170),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_EDIT), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-			276, 230, 88, 30, window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_OK), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 276), AuxPx(window, 230), AuxPx(window, 88), AuxPx(window, 30),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_OK), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-			374, 230, 88, 30, window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_CANCEL), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 374), AuxPx(window, 230), AuxPx(window, 88), AuxPx(window, 30),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROMPT_CANCEL), GetModuleHandleW(nullptr), nullptr);
+		ApplyAuxFont(window, context->font);
 		SetFocus(context->edit);
 		return 0;
 	case WM_COMMAND:
-		if (LOWORD(wParam) == IDC_AV_PROMPT_OK) {
+		// IDOK / IDCANCEL 来自 IsDialogMessage：回车和 Esc 走的是这两个命令，
+		// 不接就等于那两个键完全没反应。
+		if (LOWORD(wParam) == IDC_AV_PROMPT_OK || LOWORD(wParam) == IDOK) {
 			wchar_t buffer[2048] = {};
 			GetWindowTextW(context->edit, buffer, _countof(buffer));
 			context->value = buffer;
@@ -1203,9 +1320,15 @@ LRESULT CALLBACK AvTextPromptProc(HWND window, UINT message, WPARAM wParam, LPAR
 			DestroyWindow(window);
 			return 0;
 		}
-		if (LOWORD(wParam) == IDC_AV_PROMPT_CANCEL) { DestroyWindow(window); return 0; }
+		if (LOWORD(wParam) == IDC_AV_PROMPT_CANCEL || LOWORD(wParam) == IDCANCEL) { DestroyWindow(window); return 0; }
 		break;
 	case WM_CLOSE: DestroyWindow(window); return 0;
+	case WM_DESTROY:
+		if (context->font) {
+			DeleteObject(context->font);
+			context->font = nullptr;
+		}
+		return 0;
 	}
 	return DefWindowProcW(window, message, wParam, lParam);
 }
@@ -1230,21 +1353,24 @@ bool PromptAvText(HWND owner, LPCWSTR title, LPCWSTR prompt, std::wstring* value
 	context.title = title ? title : L"输入";
 	context.prompt = prompt ? prompt : L"请输入：";
 	context.value = *value;
-	RECT work = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-	const int x = work.left + ((work.right - work.left) - 480) / 2;
-	const int y = work.top + ((work.bottom - work.top) - 305) / 2;
+	const int width = AuxPx(owner, 480);
+	const int height = AuxPx(owner, 305);
+	const POINT origin = AuxCenterOn(owner, width, height);
 	HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST, kAvPromptClass,
 		context.title.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-		x, y, 480, 305, owner, nullptr, GetModuleHandleW(nullptr), &context);
+		origin.x, origin.y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &context);
 	if (!window) return false;
 	if (owner && IsWindowEnabled(owner)) EnableWindow(owner, FALSE);
 	ShowWindow(window, SW_SHOW);
 	UpdateWindow(window);
 	MSG message = {};
 	while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
-		TranslateMessage(&message);
-		DispatchMessageW(&message);
+		// 和其它几个选择器一致：Tab 在控件间走、Esc 发 IDCANCEL、回车发 IDOK。
+		// 多行编辑框自己会吃掉回车，所以这里不会把换行抢走。
+		if (!IsDialogMessageW(window, &message)) {
+			TranslateMessage(&message);
+			DispatchMessageW(&message);
+		}
 	}
 	if (owner && IsWindow(owner)) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
 	if (!context.accepted) return false;
@@ -1256,41 +1382,22 @@ constexpr wchar_t kExitConfirmClass[] = L"DzjsTrainerExitConfirm";
 
 // 退出确认面板的布局。绘制（PaintExitConfirm）和原生控件（WM_CREATE）共用这一组
 // 常量 —— 原来两边各写一套坐标，改一处必然错位。
-// 几何沿用原来的 520x350 / 内边距 34，只把散落的字面量收拢，不动观感。
+// 面板里只剩标题、一行说明和两个按钮，所以要不了原来 350 的高度。
 constexpr int kExitPanelWidth = 520;
-constexpr int kExitPanelHeight = 350;
+constexpr int kExitPanelHeight = 220;
 constexpr int kExitPadX = 34;
 constexpr int kExitContentWidth = kExitPanelWidth - kExitPadX * 2;   // 452
 
 constexpr int kExitTitleY = 30;
-constexpr int kExitSubtitleY = 76;
-constexpr int kExitCodeY = 116;
-constexpr int kExitCodeHeight = 38;
-constexpr int kExitHintY = 170;
-constexpr int kExitErrorY = 196;       // 贴着提示行，只留 4px
-constexpr int kExitEditY = 234;
-constexpr int kExitEditHeight = 36;
-constexpr int kExitButtonY = 286;
+constexpr int kExitSubtitleY = 74;
+constexpr int kExitHintY = 102;
+constexpr int kExitButtonY = 152;
 constexpr int kExitButtonWidth = 100;
-constexpr int kExitButtonHeight = 34;
+constexpr int kExitButtonHeight = 36;
 constexpr int kExitButtonGap = 10;
 
 // 面板圆角：和主界面卡片同一档。
 constexpr float kExitPanelRadius = 12.0f;
-// 输入框外框圆角。原来 EDIT 带 WS_EX_CLIENTEDGE，系统会画 3D 凹陷直角边，
-// 这是整个界面上唯一一处非圆角的控件边框；改成自绘细边之后用 10。
-constexpr float kExitEditRadius = 10.0f;
-
-// 验证码有效期。到点就换一组新的、并清空已输入的内容 —— 屏幕上摆着的数字
-// 只有 30 秒可用，被人拍照或者事后回头抄都来不及。
-constexpr UINT kExitCodeRefreshSeconds = 30;
-constexpr UINT_PTR kExitRefreshTimer = 1;
-// 倒计时每 200ms 校一次。不按 1000ms 走是因为 WM_TIMER 会被输入抢占、
-// 每次最多迟到一两百毫秒，累加之后显示会明显偏慢；这里按绝对时间算剩余，
-// 只在「秒数变了」的时候重画那一小块。
-constexpr UINT kExitRefreshTickMs = 200;
-// 倒计时文字占的宽度，右端对齐内容区右边界。
-constexpr int kExitCountdownWidth = 88;
 
 // 后备缓冲。整帧先在内存里画完，再**一次性** BitBlt 上屏。
 //
@@ -1366,22 +1473,17 @@ struct ExitConfirmContext {
 	std::unique_ptr<Gdiplus::Bitmap> blurredWallpaper;
 	ExitBackBuffer backBuffer;
 	std::wstring wallpaperPath;
-	int panelX = 0;
+	int panelX = 0;      // 逻辑坐标，绘制前统一 ScaleTransform
 	int panelY = 0;
-	HWND edit = nullptr;
+	float scale = 1.0f;
 	HFONT font = nullptr;
-	HBRUSH editBrush = nullptr;
-	WNDPROC originalEditProc = nullptr;
+	// owner-draw 按钮在 WM_DRAWITEM 之前要先擦一遍底，这个刷子就是面板色。
+	HBRUSH surfaceBrush = nullptr;
 	bool rawInputRegistered = false;
-	std::wstring challenge;
-	std::wstring value;
-	ULONGLONG refreshDeadline = 0;   // GetTickCount64 口径的绝对时间
-	int shownSeconds = -1;           // 当前画在屏幕上的剩余秒数，-1 表示还没画过
+	// 只有真实硬件输入才置位；PostMessage 投来的点击、SendInput 造的按键都过不去。
+	bool hardwareConfirm = false;
 	bool darkMode = false;
 	bool accepted = false;
-	bool sawPhysicalKeyboard = false;
-	bool invalidInput = false;
-	bool updatingEdit = false;
 };
 
 std::unique_ptr<Bitmap> BuildExitWallpaper(LPCWSTR path)
@@ -1479,12 +1581,8 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		return context->desktopFailure;
 	}
 
-	const int width = kExitPanelWidth;
-	const int height = kExitPanelHeight;
 	const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
 	const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-	context->panelX = (screenWidth - width) / 2;
-	context->panelY = (screenHeight - height) / 2;
 	context->blurredWallpaper = BuildExitWallpaper(context->wallpaperPath.c_str());
 	// 去掉 WS_EX_DLGMODALFRAME 和 WS_BORDER：这是个铺满整屏的窗口，系统会在
 	// 暗化后的壁纸边缘画一圈 1px 边框，看起来像一道黑线。
@@ -1496,12 +1594,18 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		SetEvent(context->readyEvent);
 		return context->desktopFailure;
 	}
-	RAWINPUTDEVICE keyboardDevice{};
-	keyboardDevice.usUsagePage = 0x01;
-	keyboardDevice.usUsage = 0x06;
-	keyboardDevice.dwFlags = RIDEV_INPUTSINK;
-	keyboardDevice.hwndTarget = context->window;
-	context->rawInputRegistered = RegisterRawInputDevices(&keyboardDevice, 1, sizeof(keyboardDevice)) != FALSE;
+	// 键盘和鼠标一起注册：确认只认真实硬件输入，两者都挡注入。
+	// （SendInput 造出来的 WM_INPUT 事件没有设备句柄，见下面两个处理函数。）
+	RAWINPUTDEVICE devices[2]{};
+	devices[0].usUsagePage = 0x01;
+	devices[0].usUsage = 0x06;   // keyboard
+	devices[0].dwFlags = RIDEV_INPUTSINK;
+	devices[0].hwndTarget = context->window;
+	devices[1].usUsagePage = 0x01;
+	devices[1].usUsage = 0x02;   // mouse
+	devices[1].dwFlags = RIDEV_INPUTSINK;
+	devices[1].hwndTarget = context->window;
+	context->rawInputRegistered = RegisterRawInputDevices(devices, 2, sizeof(devices[0])) != FALSE;
 	ShowWindow(context->window, SW_SHOW);
 	UpdateWindow(context->window);
 	SetEvent(context->readyEvent);
@@ -1514,111 +1618,60 @@ DWORD WINAPI ExitConfirmDesktopThreadProc(LPVOID parameter)
 		}
 	}
 	if (context->rawInputRegistered) {
-		keyboardDevice.dwFlags = RIDEV_REMOVE;
-		keyboardDevice.hwndTarget = nullptr;
-		RegisterRawInputDevices(&keyboardDevice, 1, sizeof(keyboardDevice));
+		for (auto& device : devices) {
+			device.dwFlags = RIDEV_REMOVE;
+			device.hwndTarget = nullptr;
+		}
+		RegisterRawInputDevices(devices, 2, sizeof(devices[0]));
 		context->rawInputRegistered = false;
 	}
 	return ERROR_SUCCESS;
 }
 
-LRESULT CALLBACK ExitConfirmEditProc(HWND edit, UINT message, WPARAM wParam, LPARAM lParam)
+// 输入只认真货。SendInput 造出来的 RAWINPUT 事件 hDevice 是空句柄，用 PostMessage
+// 直接投的鼠标消息根本不会产生 WM_INPUT —— 两条注入路径都过不了下面这两关。
+bool IsHardwareInput(const RAWINPUT& raw)
 {
-	auto* context = reinterpret_cast<ExitConfirmContext*>(GetWindowLongPtrW(edit, GWLP_USERDATA));
-	if (context && !context->updatingEdit &&
-		(message == WM_CHAR || message == WM_UNICHAR || message == WM_SYSCHAR ||
-			message == WM_KEYDOWN || message == WM_KEYUP ||
-			message == WM_SYSKEYDOWN || message == WM_SYSKEYUP ||
-			message == WM_IME_CHAR || message == WM_IME_COMPOSITION ||
-			message == WM_PASTE || message == WM_CUT || message == WM_CLEAR || message == WM_UNDO ||
-			message == WM_SETTEXT || message == EM_REPLACESEL)) {
-		// Physical key presses also produce legacy key messages after WM_INPUT.
-		// Drop those duplicates silently; only WM_INPUT is allowed to update text.
-		return 0;
+	return raw.header.hDevice != nullptr;
+}
+
+void HandleExitConfirmKeyboard(HWND window, ExitConfirmContext* context, const RAWINPUT& raw)
+{
+	const RAWKEYBOARD& keyboard = raw.data.keyboard;
+	if (!context || (keyboard.Flags & RI_KEY_BREAK) != 0) return;
+	// 只剩两个键有意义：回车确认，Esc 取消。走 RawInput 是为了不受焦点影响 ——
+	// 弹窗刚出来时焦点还没落稳，靠 WM_KEYDOWN 会漏掉第一下。
+	if (keyboard.VKey == VK_RETURN) {
+		if (!IsHardwareInput(raw)) return;
+		context->hardwareConfirm = true;
+		PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
+		return;
 	}
-	return context && context->originalEditProc
-		? CallWindowProcW(context->originalEditProc, edit, message, wParam, lParam)
-		: DefWindowProcW(edit, message, wParam, lParam);
+	// 取消不设门槛：模拟出来的 Esc 最多少退一次，不值得为它挡掉真键盘。
+	if (keyboard.VKey == VK_ESCAPE)
+		PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_CANCEL, BN_CLICKED), 0);
 }
 
-std::wstring MakeExitChallenge()
-{
-	static constexpr wchar_t digits[] = L"0123456789";
-	std::mt19937 generator(static_cast<unsigned int>(GetTickCount64() ^ (static_cast<ULONGLONG>(GetCurrentProcessId()) << 16)));
-	std::uniform_int_distribution<int> distribution(0, 9);
-	std::wstring result;
-	result.reserve(6);
-	for (int index = 0; index < 6; ++index) result.push_back(digits[distribution(generator)]);
-	return result;
-}
-
-void SetExitConfirmEditText(ExitConfirmContext* context, const std::wstring& value, size_t caret)
-{
-	if (!context || !context->edit) return;
-	context->updatingEdit = true;
-	SetWindowTextW(context->edit, value.c_str());
-	context->updatingEdit = false;
-	const LONG position = static_cast<LONG>((std::min)(caret, value.size()));
-	SendMessageW(context->edit, EM_SETSEL, position, position);
-}
-
-// 换一组新验证码。必须同时清空已输入的内容和错误态：
-// 旧数字对新码必然不匹配，留着只会让用户以为是自己打错了。
-void RefreshExitChallenge(ExitConfirmContext* context)
+void HandleExitConfirmMouse(HWND window, ExitConfirmContext* context, const RAWINPUT& raw)
 {
 	if (!context) return;
-	context->challenge = MakeExitChallenge();
-	context->value.clear();
-	context->invalidInput = false;
-	SetExitConfirmEditText(context, std::wstring(), 0);
-}
-
-void HandleExitConfirmKeyboard(HWND window, ExitConfirmContext* context, const RAWKEYBOARD& keyboard)
-{
-	if (!context || !context->edit || (keyboard.Flags & RI_KEY_BREAK) != 0) return;
-	context->sawPhysicalKeyboard = true;
-	if (keyboard.VKey == VK_RETURN) {
-		SendMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
-		return;
-	}
-	if (keyboard.VKey == VK_ESCAPE) {
-		SendMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_CANCEL, BN_CLICKED), 0);
-		return;
-	}
-
-	wchar_t digit = L'\0';
-	if (keyboard.VKey >= '0' && keyboard.VKey <= '9') {
-		if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) == 0)
-			digit = static_cast<wchar_t>(keyboard.VKey);
-	}
-	else if (keyboard.VKey >= VK_NUMPAD0 && keyboard.VKey <= VK_NUMPAD9) {
-		digit = static_cast<wchar_t>(L'0' + (keyboard.VKey - VK_NUMPAD0));
-	}
-	if (digit == L'\0' && keyboard.VKey != VK_BACK) return;
-
-	wchar_t buffer[64]{};
-	GetWindowTextW(context->edit, buffer, _countof(buffer));
-	std::wstring value = buffer;
-	DWORD selectionStart = 0;
-	DWORD selectionEnd = 0;
-	SendMessageW(context->edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart),
-		reinterpret_cast<LPARAM>(&selectionEnd));
-	const size_t start = (std::min)(static_cast<size_t>(selectionStart), value.size());
-	const size_t end = (std::min)(static_cast<size_t>(selectionEnd), value.size());
-	if (digit != L'\0') {
-		if (value.size() - (end - start) >= context->challenge.size()) return;
-		value.replace(start, end - start, 1, digit);
-		SetExitConfirmEditText(context, value, start + 1);
-		return;
-	}
-	if (start != end) {
-		value.erase(start, end - start);
-		SetExitConfirmEditText(context, value, start);
-	}
-	else if (start > 0) {
-		value.erase(start - 1, 1);
-		SetExitConfirmEditText(context, value, start - 1);
-	}
+	if ((raw.data.mouse.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) == 0) return;
+	if (!IsHardwareInput(raw)) return;
+	POINT cursor{};
+	if (!GetCursorPos(&cursor)) return;
+	// 「取消」自己有按钮窗口，点在它身上不算确认。
+	HWND cancel = GetDlgItem(window, IDC_EXIT_CONFIRM_CANCEL);
+	RECT cancelRect{};
+	if (cancel && GetWindowRect(cancel, &cancelRect) && PtInRect(&cancelRect, cursor)) return;
+	// 窗口是铺满整屏的 WS_POPUP，客户区原点和屏幕原点重合，所以光标位置
+	// 除以缩放比就是面板用的逻辑坐标。
+	const float scale = context->scale > 0.0f ? context->scale : 1.0f;
+	const float logicalX = static_cast<float>(cursor.x) / scale;
+	const float logicalY = static_cast<float>(cursor.y) / scale;
+	if (logicalX < context->panelX || logicalX > context->panelX + kExitPanelWidth) return;
+	if (logicalY < context->panelY || logicalY > context->panelY + kExitPanelHeight) return;
+	context->hardwareConfirm = true;
+	PostMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
 }
 
 void PaintExitConfirm(HWND window, ExitConfirmContext* context)
@@ -1627,11 +1680,16 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	HDC dc = BeginPaint(window, &ps);
 	RECT client{};
 	GetClientRect(window, &client);
-	const int width = client.right;
-	const int height = client.bottom;
+	const int pixelWidth = client.right;
+	const int pixelHeight = client.bottom;
+	// 面板按 96 DPI 的逻辑坐标画，绘制前统一缩放 —— 和主窗口一个路数。
+	// 后备缓冲和脏矩形仍然是物理像素，只有绘制坐标系是逻辑的。
+	const float scale = context->scale > 0.0f ? context->scale : 1.0f;
+	const float width = static_cast<float>(pixelWidth) / scale;
+	const float height = static_cast<float>(pixelHeight) / scale;
 	ExitBackBuffer& back = context->backBuffer;
-	if (!back.surface || back.width != width || back.height != height) {
-		if (!back.Create(width, height)) {
+	if (!back.surface || back.width != pixelWidth || back.height != pixelHeight) {
+		if (!back.Create(pixelWidth, pixelHeight)) {
 			// 拿不到后备缓冲就退回直接画。会有中间态，但总比不画强。
 			Graphics fallback(dc);
 			fallback.Clear(Color(255, 18, 18, 18));
@@ -1641,9 +1699,11 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	}
 	// 只渲染脏矩形，别每秒把 1920x1080 整屏重画一遍。
 	Graphics graphics(back.surface.get());
-	graphics.SetClip(RectF(static_cast<REAL>(ps.rcPaint.left), static_cast<REAL>(ps.rcPaint.top),
-		static_cast<REAL>(ps.rcPaint.right - ps.rcPaint.left),
-		static_cast<REAL>(ps.rcPaint.bottom - ps.rcPaint.top)));
+	if (scale != 1.0f) graphics.ScaleTransform(scale, scale);
+	// rcPaint 是物理坐标，先折算回逻辑坐标再设裁剪，否则高 DPI 下只画左上角一块。
+	graphics.SetClip(RectF(static_cast<REAL>(ps.rcPaint.left) / scale, static_cast<REAL>(ps.rcPaint.top) / scale,
+		static_cast<REAL>(ps.rcPaint.right - ps.rcPaint.left) / scale,
+		static_cast<REAL>(ps.rcPaint.bottom - ps.rcPaint.top) / scale));
 	// 抗锯齿只影响边缘质量，不改任何几何或配色：圆角不再有台阶，小字不再发虚。
 	graphics.SetSmoothingMode(SmoothingModeAntiAlias);
 	graphics.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
@@ -1654,9 +1714,9 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 	// 换成中性深灰，壁纸自己的颜色才能透出来。
 	graphics.Clear(Color(255, 18, 18, 18));
 	if (context->blurredWallpaper && context->blurredWallpaper->GetLastStatus() == Ok)
-		graphics.DrawImage(context->blurredWallpaper.get(), 0, 0, width, height);
+		graphics.DrawImage(context->blurredWallpaper.get(), 0.0f, 0.0f, width, height);
 	SolidBrush dimmer(Color(d ? 172 : 136, 10, 10, 10));
-	graphics.FillRectangle(&dimmer, 0, 0, width, height);
+	graphics.FillRectangle(&dimmer, 0.0f, 0.0f, width, height);
 
 	const float panelX = static_cast<float>(context->panelX);
 	const float panelY = static_cast<float>(context->panelY);
@@ -1664,47 +1724,17 @@ void PaintExitConfirm(HWND window, ExitConfirmContext* context)
 		static_cast<float>(kExitPanelWidth), static_cast<float>(kExitPanelHeight));
 	FillRound(graphics, panel, kExitPanelRadius, C(d, 255, 255, 255, 38, 45, 42));
 
-	Text(graphics, L"确认退出 Dzjs Trainer", panelX + kExitPadX, panelY + kExitTitleY,
+	Text(graphics, L"退出 Dzjs Trainer？", panelX + kExitPadX, panelY + kExitTitleY,
 		static_cast<float>(kExitContentWidth), 30, 19, FontStyleBold,
 		C(d, 30, 36, 33, 225, 233, 229));
-	Text(graphics, L"为确认是本人操作，请在下方原样输入这组数字：",
+	Text(graphics, L"退出后训练器停止拦截，教室软件可以重新接管这台电脑。",
 		panelX + kExitPadX, panelY + kExitSubtitleY,
-		static_cast<float>(kExitContentWidth), 24, 11, FontStyleRegular,
+		static_cast<float>(kExitContentWidth), 22, 11, FontStyleRegular,
 		C(d, 81, 91, 86, 171, 183, 177));
-	Text(graphics, context->challenge.c_str(), panelX + kExitPadX, panelY + kExitCodeY,
-		static_cast<float>(kExitContentWidth), static_cast<float>(kExitCodeHeight), 25, FontStyleBold,
-		C(d, 0, 107, 95, 130, 213, 199), StringAlignmentCenter);
-	// 刷新倒计时：压在验证码同一行的右端，11px 小字，不占新行、不动任何几何。
-	// 不给它加底色或边框 —— 那会变成徽章，属于多余装饰。
-	if (context->shownSeconds >= 0) {
-		wchar_t countdown[16]{};
-		swprintf_s(countdown, L"%d 秒后刷新", context->shownSeconds);
-		Text(graphics, countdown,
-			panelX + kExitPadX + kExitContentWidth - kExitCountdownWidth,
-			panelY + kExitCodeY + 13,
-			static_cast<float>(kExitCountdownWidth), 20, 11, FontStyleRegular,
-			C(d, 150, 160, 155, 120, 132, 126), StringAlignmentFar);
-	}
-	Text(graphics, L"仅接受真实键盘按键，粘贴或程序模拟输入不会通过验证。",
+	Text(graphics, L"点一下面板任意处即退出，Esc 取消；只认真实鼠标，模拟输入无效。",
 		panelX + kExitPadX, panelY + kExitHintY,
 		static_cast<float>(kExitContentWidth), 22, 11, FontStyleRegular,
 		C(d, 91, 70, 20, 232, 211, 162), StringAlignmentCenter);
-	if (context->invalidInput) {
-		Text(graphics, L"输入不匹配或不是直接键盘输入，请重试。",
-			panelX + kExitPadX, panelY + kExitErrorY,
-			static_cast<float>(kExitContentWidth), 22, 11, FontStyleBold,
-			C(d, 155, 45, 36, 244, 178, 165), StringAlignmentCenter);
-	}
-
-	// 输入框外框。原来 EDIT 带 WS_EX_CLIENTEDGE，系统画 3D 凹陷直角边，
-	// 是整个界面上唯一一处非圆角控件边框；改成自绘一圈 1px 细边，
-	// 填充色与面板同色，所以观感上只是「一个描边圆角框」。
-	const RectF editFrame(panelX + kExitPadX, panelY + kExitEditY,
-		static_cast<float>(kExitContentWidth), static_cast<float>(kExitEditHeight));
-	FillRound(graphics, editFrame, kExitEditRadius, C(d, 255, 255, 255, 38, 45, 42));
-	StrokeRound(graphics, editFrame, kExitEditRadius,
-		context->invalidInput ? C(d, 226, 150, 140, 150, 60, 52)
-			: C(d, 205, 213, 209, 60, 70, 65));
 
 	// 内存里已经画完整了，这里一次性搬上屏 —— 窗口只收到这一次写操作，
 	// 不会出现「只画了底色」或「壁纸还没盖上面板」的中间帧。
@@ -1728,60 +1758,55 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE: {
-		context->font = CreateFontW(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		context->scale = AuxScale(window);
+		{
+			// 面板在逻辑坐标里居中：窗口铺满整块屏，除以缩放比就是逻辑客户区。
+			RECT client{};
+			GetClientRect(window, &client);
+			const float logicalWidth = static_cast<float>(client.right) / context->scale;
+			const float logicalHeight = static_cast<float>(client.bottom) / context->scale;
+			context->panelX = static_cast<int>(lround((logicalWidth - kExitPanelWidth) / 2.0));
+			context->panelY = static_cast<int>(lround((logicalHeight - kExitPanelHeight) / 2.0));
+		}
+		context->font = CreateFontW(AuxPx(window, 16), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-		// 与面板同色：外框填充也是这个色，所以输入框看起来只是「面板上的一个描边框」。
-		context->editBrush = CreateSolidBrush(ExitPanelColor(context->darkMode));
-		// 去掉 WS_EX_CLIENTEDGE（3D 凹陷直角边），缩进自绘圆角框里，四周各留 6px。
-		context->edit = CreateWindowExW(0, L"EDIT", L"",
-			WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_CENTER | ES_AUTOHSCROLL | ES_NUMBER,
-			context->panelX + kExitPadX + 11, context->panelY + kExitEditY + 6,
-			kExitContentWidth - 22, kExitEditHeight - 12, window,
-			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_EDIT), GetModuleHandleW(nullptr), nullptr);
-		if (context->font) SendMessageW(context->edit, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
-		SetWindowLongPtrW(context->edit, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(context));
-		context->originalEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(context->edit, GWLP_WNDPROC,
-			reinterpret_cast<LONG_PTR>(ExitConfirmEditProc)));
+		// owner-draw 按钮擦底用，和面板同色，四角才不会露出系统灰。
+		context->surfaceBrush = CreateSolidBrush(ExitPanelColor(context->darkMode));
 		const int buttonY = context->panelY + kExitButtonY;
 		const int cancelX = context->panelX + kExitPadX + kExitContentWidth - kExitButtonWidth;
 		const int okX = cancelX - kExitButtonGap - kExitButtonWidth;
-		HWND okButton = CreateWindowExW(0, L"BUTTON", L"确认退出",
+		HWND okButton = CreateWindowExW(0, L"BUTTON", L"退出程序",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-			okX, buttonY, kExitButtonWidth, kExitButtonHeight, window,
+			AuxPx(window, okX), AuxPx(window, buttonY),
+			AuxPx(window, kExitButtonWidth), AuxPx(window, kExitButtonHeight), window,
 			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_OK), GetModuleHandleW(nullptr), nullptr);
 		HWND cancelButton = CreateWindowExW(0, L"BUTTON", L"取消",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
-			cancelX, buttonY, kExitButtonWidth, kExitButtonHeight, window,
+			AuxPx(window, cancelX), AuxPx(window, buttonY),
+			AuxPx(window, kExitButtonWidth), AuxPx(window, kExitButtonHeight), window,
 			reinterpret_cast<HMENU>(IDC_EXIT_CONFIRM_CANCEL), GetModuleHandleW(nullptr), nullptr);
-		// 原来没注册悬停，这两个按钮是全界面唯一不响应鼠标的控件。
 		EnableNativeButtonHover(okButton);
 		EnableNativeButtonHover(cancelButton);
-		context->refreshDeadline = GetTickCount64() + kExitCodeRefreshSeconds * 1000ULL;
-		context->shownSeconds = static_cast<int>(kExitCodeRefreshSeconds);
-		SetTimer(window, kExitRefreshTimer, kExitRefreshTickMs, nullptr);
-		SetFocus(context->edit);
+		if (context->font) {
+			SendMessageW(okButton, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
+			SendMessageW(cancelButton, WM_SETFONT, reinterpret_cast<WPARAM>(context->font), TRUE);
+		}
+		SetFocus(okButton);
 		return 0;
 	}
-	case WM_TIMER: {
-		if (wParam != kExitRefreshTimer) break;
-		const ULONGLONG now = GetTickCount64();
-		if (now >= context->refreshDeadline) {
-			RefreshExitChallenge(context);
-			context->refreshDeadline = now + kExitCodeRefreshSeconds * 1000ULL;
-			context->shownSeconds = static_cast<int>(kExitCodeRefreshSeconds);
-			InvalidateRect(window, nullptr, FALSE);
-			return 0;
+	case WM_LBUTTONDOWN: {
+		// 真点击已经在 WM_INPUT 里判过设备句柄，这条消息谁都能 Post，不当真。
+		// 只有 RawInput 没注册上的机器（极少数）才退回这里点哪算哪。
+		if (context->rawInputRegistered) return 0;
+		const int x = GET_X_LPARAM(lParam);
+		const int y = GET_Y_LPARAM(lParam);
+		const float scale = context->scale > 0.0f ? context->scale : 1.0f;
+		const float logicalX = static_cast<float>(x) / scale;
+		const float logicalY = static_cast<float>(y) / scale;
+		if (logicalX >= context->panelX && logicalX <= context->panelX + kExitPanelWidth &&
+			logicalY >= context->panelY && logicalY <= context->panelY + kExitPanelHeight) {
+			SendMessageW(window, WM_COMMAND, MAKEWPARAM(IDC_EXIT_CONFIRM_OK, BN_CLICKED), 0);
 		}
-		const int remaining = static_cast<int>((context->refreshDeadline - now + 999) / 1000);
-		if (remaining == context->shownSeconds) return 0;
-		context->shownSeconds = remaining;
-		// 只重画倒计时那一小块，不要每秒整窗重绘一遍。
-		RECT dirty{};
-		dirty.left = context->panelX + kExitPadX + kExitContentWidth - kExitCountdownWidth - 4;
-		dirty.top = context->panelY + kExitCodeY;
-		dirty.right = context->panelX + kExitPadX + kExitContentWidth;
-		dirty.bottom = context->panelY + kExitCodeY + kExitCodeHeight;
-		InvalidateRect(window, &dirty, FALSE);
 		return 0;
 	}
 	case WM_PAINT:
@@ -1805,36 +1830,28 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		return 0;
 	}
 	case WM_INPUT: {
-		UINT size = 0;
-		if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, nullptr, &size,
-			sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) && size >= sizeof(RAWINPUTHEADER)) {
-			std::vector<BYTE> rawData(size);
-			if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, rawData.data(), &size,
-				sizeof(RAWINPUTHEADER)) == size) {
-				const auto* raw = reinterpret_cast<const RAWINPUT*>(rawData.data());
-				if (raw->header.dwType == RIM_TYPEKEYBOARD)
-					HandleExitConfirmKeyboard(window, context, raw->data.keyboard);
-			}
+		// 鼠标注册成 INPUTSINK 之后这条消息是高频的（每次移动都来一次），
+		// 用栈上的 RAWINPUT 接，别每次 new 一块 buffer。
+		RAWINPUT raw{};
+		UINT size = static_cast<UINT>(sizeof(raw));
+		const UINT copied = GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size,
+			sizeof(RAWINPUTHEADER));
+		if (copied != static_cast<UINT>(-1) && copied == size) {
+			if (raw.header.dwType == RIM_TYPEKEYBOARD)
+				HandleExitConfirmKeyboard(window, context, raw);
+			else if (raw.header.dwType == RIM_TYPEMOUSE)
+				HandleExitConfirmMouse(window, context, raw);
 		}
 		return 0;
 	}
-	case WM_PASTE:
-		context->invalidInput = true;
-		return 0;
 	case WM_COMMAND:
 		if (LOWORD(wParam) == IDC_EXIT_CONFIRM_OK) {
-			wchar_t buffer[64]{};
-			GetWindowTextW(context->edit, buffer, _countof(buffer));
-			context->value = buffer;
-			context->accepted = context->sawPhysicalKeyboard &&
-				context->value == context->challenge;
-			if (context->accepted) DestroyWindow(window);
-			else {
-				context->invalidInput = true;
-				SetFocus(context->edit);
-				SendMessageW(context->edit, EM_SETSEL, 0, -1);
-				InvalidateRect(window, nullptr, FALSE);
-			}
+			// 按钮的 BN_CLICKED 分不出来源，所以门槛放在这里：没有真实输入打过招呼，
+			// 就算把 WM_COMMAND 直接投进来也不退。RawInput 没注册上的机器退回旧行为。
+			if (context->rawInputRegistered && !context->hardwareConfirm) return 0;
+			if (context->accepted) return 0;
+			context->accepted = true;
+			DestroyWindow(window);
 			return 0;
 		}
 		if (LOWORD(wParam) == IDC_EXIT_CONFIRM_CANCEL) {
@@ -1846,24 +1863,15 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		DestroyWindow(window);
 		return 0;
 	case WM_DESTROY:
-		// 定时器属于这个窗口，销毁前必须停掉，否则消息会投给一个正在拆的窗口。
-		KillTimer(window, kExitRefreshTimer);
 		PostQuitMessage(0);
 		return 0;
-	case WM_CTLCOLORSTATIC: {
-		HDC dc = reinterpret_cast<HDC>(wParam);
-		SetTextColor(dc, context->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
-		SetBkMode(dc, TRANSPARENT);
-		return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
-	}
-	case WM_CTLCOLOREDIT:
 	case WM_CTLCOLORBTN: {
 		// BTN 也要接管：owner-draw 按钮在 WM_DRAWITEM 之前会先用这个画刷擦一遍底，
 		// 不接管就是系统灰 RGB(240,240,240)，深色面板上一眼就看见。
 		HDC dc = reinterpret_cast<HDC>(wParam);
 		SetTextColor(dc, context->darkMode ? RGB(222, 230, 226) : RGB(35, 42, 39));
 		SetBkColor(dc, ExitPanelColor(context->darkMode));
-		return reinterpret_cast<LRESULT>(context->editBrush);
+		return reinterpret_cast<LRESULT>(context->surfaceBrush);
 	}
 	case WM_DRAWITEM: {
 		const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
@@ -1877,16 +1885,9 @@ LRESULT CALLBACK ExitConfirmProc(HWND window, UINT message, WPARAM wParam, LPARA
 		break;
 	}
 	case WM_NCDESTROY:
-		if (context->edit && context->originalEditProc && IsWindow(context->edit)) {
-			SetWindowLongPtrW(context->edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(context->originalEditProc));
-			context->originalEditProc = nullptr;
-		}
-		else {
-			context->originalEditProc = nullptr;
-		}
-		if (context->editBrush) {
-			DeleteObject(context->editBrush);
-			context->editBrush = nullptr;
+		if (context->surfaceBrush) {
+			DeleteObject(context->surfaceBrush);
+			context->surfaceBrush = nullptr;
 		}
 		if (context->font) {
 			DeleteObject(context->font);
@@ -1915,7 +1916,6 @@ bool ConfirmExit(HWND owner, bool darkMode)
 	ExitConfirmContext context;
 	context.owner = owner;
 	context.darkMode = darkMode;
-	context.challenge = MakeExitChallenge();
 	wchar_t wallpaperPath[MAX_PATH] = {};
 	if (SystemParametersInfoW(SPI_GETDESKWALLPAPER, _countof(wallpaperPath), wallpaperPath, 0))
 		context.wallpaperPath = wallpaperPath;
@@ -1993,6 +1993,7 @@ struct AvProcessPickerContext {
 	HWND window = nullptr;
 	HWND list = nullptr;
 	HWND status = nullptr;
+	HFONT font = nullptr;
 	std::vector<AvProcessEntry> entries;
 	DWORD selectedProcessId = 0;
 	std::wstring selectedName;
@@ -2068,34 +2069,41 @@ LRESULT CALLBACK AvProcessPickerProc(HWND window, UINT message, WPARAM wParam, L
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE: {
+		context->font = CreateAuxUiFont(window);
 		context->list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
 			WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
-			16, 16, 572, 344, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_LIST), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 16), AuxPx(window, 16), AuxPx(window, 572), AuxPx(window, 344),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_LIST), GetModuleHandleW(nullptr), nullptr);
 		ListView_SetExtendedListViewStyle(context->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_GRIDLINES);
 		LVCOLUMNW column = {};
 		column.mask = LVCF_TEXT | LVCF_WIDTH;
-		column.cx = 420;
+		column.cx = AuxPx(window, 420);
 		column.pszText = const_cast<LPWSTR>(L"进程名称");
 		ListView_InsertColumn(context->list, 0, &column);
-		column.cx = 120;
+		column.cx = AuxPx(window, 120);
 		column.pszText = const_cast<LPWSTR>(L"PID");
 		ListView_InsertColumn(context->list, 1, &column);
 		context->status = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE,
-			16, 370, 280, 28, window, nullptr, GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 16), AuxPx(window, 370), AuxPx(window, 280), AuxPx(window, 28),
+			window, nullptr, GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"刷新", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-			308, 366, 82, 32, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_REFRESH), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 308), AuxPx(window, 366), AuxPx(window, 82), AuxPx(window, 32),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_REFRESH), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
-			400, 366, 88, 32, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_OK), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 400), AuxPx(window, 366), AuxPx(window, 88), AuxPx(window, 32),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_OK), GetModuleHandleW(nullptr), nullptr);
 		CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-			498, 366, 88, 32, window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_CANCEL), GetModuleHandleW(nullptr), nullptr);
+			AuxPx(window, 498), AuxPx(window, 366), AuxPx(window, 88), AuxPx(window, 32),
+			window, reinterpret_cast<HMENU>(IDC_AV_PROCESS_CANCEL), GetModuleHandleW(nullptr), nullptr);
+		ApplyAuxFont(window, context->font);
 		PopulateAvProcessPicker(context);
 		SetFocus(context->list);
 		return 0;
 	}
 	case WM_COMMAND:
 		if (LOWORD(wParam) == IDC_AV_PROCESS_REFRESH) { PopulateAvProcessPicker(context); return 0; }
-		if (LOWORD(wParam) == IDC_AV_PROCESS_OK) { AcceptAvProcessSelection(context); return 0; }
-		if (LOWORD(wParam) == IDC_AV_PROCESS_CANCEL) { DestroyWindow(window); return 0; }
+		if (LOWORD(wParam) == IDC_AV_PROCESS_OK || LOWORD(wParam) == IDOK) { AcceptAvProcessSelection(context); return 0; }
+		if (LOWORD(wParam) == IDC_AV_PROCESS_CANCEL || LOWORD(wParam) == IDCANCEL) { DestroyWindow(window); return 0; }
 		break;
 	case WM_NOTIFY:
 		if (reinterpret_cast<NMHDR*>(lParam)->idFrom == IDC_AV_PROCESS_LIST &&
@@ -2105,6 +2113,12 @@ LRESULT CALLBACK AvProcessPickerProc(HWND window, UINT message, WPARAM wParam, L
 		}
 		break;
 	case WM_CLOSE: DestroyWindow(window); return 0;
+	case WM_DESTROY:
+		if (context->font) {
+			DeleteObject(context->font);
+			context->font = nullptr;
+		}
+		return 0;
 	}
 	return DefWindowProcW(window, message, wParam, lParam);
 }
@@ -2126,15 +2140,12 @@ bool ChooseAvProcess(HWND owner, DWORD* processId, std::wstring* processName)
 	}
 	AvProcessPickerContext context;
 	context.owner = owner;
-	RECT work = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-	const int width = 620;
-	const int height = 450;
-	const int x = work.left + ((work.right - work.left) - width) / 2;
-	const int y = work.top + ((work.bottom - work.top) - height) / 2;
+	const int width = AuxPx(owner, 620);
+	const int height = AuxPx(owner, 450);
+	const POINT origin = AuxCenterOn(owner, width, height);
 	HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST, kAvProcessPickerClass,
 		L"选择运行进程", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-		x, y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &context);
+		origin.x, origin.y, width, height, owner, nullptr, GetModuleHandleW(nullptr), &context);
 	if (!window) return false;
 	if (owner && IsWindowEnabled(owner)) EnableWindow(owner, FALSE);
 	ShowWindow(window, SW_SHOW);
@@ -2363,7 +2374,7 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 	switch (message) {
 	case WM_CREATE:
 	{
-		context->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		context->font = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
 			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 			DEFAULT_PITCH, L"Microsoft YaHei UI");
 		context->pathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -2393,9 +2404,9 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 			LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_CHECKBOXES);
 		LVCOLUMNW column = {};
 		column.mask = LVCF_TEXT | LVCF_WIDTH;
-		column.cx = 510; column.pszText = const_cast<LPWSTR>(L"名称");
+		column.cx = AuxPx(window, 510); column.pszText = const_cast<LPWSTR>(L"名称");
 		ListView_InsertColumn(context->list, 0, &column);
-		column.cx = 120; column.pszText = const_cast<LPWSTR>(L"类型");
+		column.cx = AuxPx(window, 120); column.pszText = const_cast<LPWSTR>(L"类型");
 		ListView_InsertColumn(context->list, 1, &column);
 
 		wchar_t modulePath[32768] = {};
@@ -2409,15 +2420,39 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 	{
 		const int width = LOWORD(lParam);
 		const int height = HIWORD(lParam);
-		MoveWindow(context->pathEdit, 16, 16, (std::max)(160, width - 190), 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_GO), width - 164, 16, 68, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_UP), width - 88, 16, 72, 30, TRUE);
-		MoveWindow(context->list, 16, 58, width - 32, (std::max)(120, height - 136), TRUE);
-		MoveWindow(context->status, 18, height - 66, (std::max)(120, width - 330), 24, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_ALL), width - 306, height - 72, 94, 32, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_OK), width - 202, height - 72, 88, 32, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_SAMPLE_CANCEL), width - 104, height - 72, 88, 32, TRUE);
+		MoveWindow(context->pathEdit, AuxPx(window, 16), AuxPx(window, 16),
+			(std::max)(AuxPx(window, 160), width - AuxPx(window, 190)), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_GO), width - AuxPx(window, 164), AuxPx(window, 16),
+			AuxPx(window, 68), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_UP), width - AuxPx(window, 88), AuxPx(window, 16),
+			AuxPx(window, 72), AuxPx(window, 30), TRUE);
+		MoveWindow(context->list, AuxPx(window, 16), AuxPx(window, 58), width - AuxPx(window, 32),
+			(std::max)(AuxPx(window, 120), height - AuxPx(window, 136)), TRUE);
+		MoveWindow(context->status, AuxPx(window, 18), height - AuxPx(window, 66),
+			(std::max)(AuxPx(window, 120), width - AuxPx(window, 330)), AuxPx(window, 24), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_ALL), width - AuxPx(window, 306), height - AuxPx(window, 72),
+			AuxPx(window, 94), AuxPx(window, 32), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_OK), width - AuxPx(window, 202), height - AuxPx(window, 72),
+			AuxPx(window, 88), AuxPx(window, 32), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_SAMPLE_CANCEL), width - AuxPx(window, 104), height - AuxPx(window, 72),
+			AuxPx(window, 88), AuxPx(window, 32), TRUE);
 		return 0;
+	}
+	case WM_DPICHANGED:
+	{
+		// 拖到另一块屏：字号和列宽都要换。几何不自己算 —— 交给 DefWindowProc
+		// 按系统建议的矩形改尺寸，随后那条 WM_SIZE 会用新 DPI 重排。
+		HFONT replacement = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH, L"Microsoft YaHei UI");
+		if (replacement) {
+			if (context->font) DeleteObject(context->font);
+			context->font = replacement;
+			ApplyAuxFont(window, context->font);
+		}
+		ListView_SetColumnWidth(context->list, 0, AuxPx(window, 510));
+		ListView_SetColumnWidth(context->list, 1, AuxPx(window, 120));
+		break;
 	}
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
@@ -2454,9 +2489,11 @@ LRESULT CALLBACK SamplePickerWindowProc(HWND window, UINT message, WPARAM wParam
 			return 0;
 		}
 		case IDC_SAMPLE_OK:
+		case IDOK:
 			CompleteSamplePickerSelection(context);
 			return 0;
 		case IDC_SAMPLE_CANCEL:
+		case IDCANCEL:
 			context->result = SampleDialogResult::Cancelled;
 			DestroyWindow(window);
 			return 0;
@@ -2512,12 +2549,11 @@ DWORD WINAPI ChooseExecutableSamplesThreadProc(LPVOID parameter)
 		return context->failure;
 	}
 
-	RECT workArea = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+	RECT workArea = AuxWorkArea(context->owner);
 	RECT ownerRect = workArea;
 	if (context->owner) GetWindowRect(context->owner, &ownerRect);
-	const int width = 760;
-	const int height = 540;
+	const int width = AuxPx(context->owner, 760);
+	const int height = AuxPx(context->owner, 540);
 	const int x = (std::max)(workArea.left,
 		(std::min)(workArea.right - width, ownerRect.left + (ownerRect.right - ownerRect.left - width) / 2));
 	const int y = (std::max)(workArea.top,
@@ -2763,7 +2799,7 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE: {
-		context->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+		context->font = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
 			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 			DEFAULT_PITCH, L"Microsoft YaHei UI");
 		context->pathEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -2797,15 +2833,27 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 		ListView_SetExtendedListViewStyle(context->list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
 		LVCOLUMNW column = {};
 		column.mask = LVCF_TEXT | LVCF_WIDTH;
-		column.cx = 520; column.pszText = const_cast<LPWSTR>(L"名称");
+		column.cx = AuxPx(window, 520); column.pszText = const_cast<LPWSTR>(L"名称");
 		ListView_InsertColumn(context->list, 0, &column);
-		column.cx = 120; column.pszText = const_cast<LPWSTR>(L"类型");
+		column.cx = AuxPx(window, 120); column.pszText = const_cast<LPWSTR>(L"类型");
 		ListView_InsertColumn(context->list, 1, &column);
-		wchar_t modulePath[32768] = {};
-		GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
-		wchar_t* slash = wcsrchr(modulePath, L'\\');
-		if (slash) *slash = L'\0';
-		NavigateLogSavePicker(context, slash ? modulePath : L"");
+		// 导出的日志也默认落在 logs 目录，和按天写的运行日志放在一起。
+		std::wstring startDir;
+		const wchar_t* todayLog = currentApp ? currentApp->GetPartFullPath(PART_LOG) : nullptr;
+		if (todayLog && *todayLog) {
+			startDir = todayLog;
+			const size_t separator = startDir.find_last_of(L"\\/");
+			if (separator != std::wstring::npos) startDir.resize(separator);
+			if (GetFileAttributesW(startDir.c_str()) == INVALID_FILE_ATTRIBUTES) startDir.clear();
+		}
+		if (startDir.empty()) {
+			wchar_t modulePath[32768] = {};
+			GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
+			wchar_t* slash = wcsrchr(modulePath, L'\\');
+			if (slash) *slash = L'\0';
+			startDir = slash ? modulePath : L"";
+		}
+		NavigateLogSavePicker(context, startDir);
 		SetFocus(context->nameEdit);
 		SendMessageW(context->nameEdit, EM_SETSEL, 0, -1);
 		return 0;
@@ -2813,17 +2861,41 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 	case WM_SIZE: {
 		const int width = LOWORD(lParam);
 		const int height = HIWORD(lParam);
-		MoveWindow(context->pathEdit, 16, 16, (std::max)(160, width - 190), 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_GO), width - 164, 16, 68, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_UP), width - 88, 16, 72, 30, TRUE);
-		MoveWindow(context->list, 16, 58, width - 32, (std::max)(120, height - 180), TRUE);
-		MoveWindow(context->status, 18, height - 150, width - 36, 24, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_LABEL), 18, height - 112, 48, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_NAME), 72, height - 112, (std::max)(180, width - 440), 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_REFRESH), width - 350, height - 112, 78, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_OK), width - 256, height - 112, 88, 30, TRUE);
-		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_CANCEL), width - 158, height - 112, 88, 30, TRUE);
+		MoveWindow(context->pathEdit, AuxPx(window, 16), AuxPx(window, 16),
+			(std::max)(AuxPx(window, 160), width - AuxPx(window, 190)), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_GO), width - AuxPx(window, 164), AuxPx(window, 16),
+			AuxPx(window, 68), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_UP), width - AuxPx(window, 88), AuxPx(window, 16),
+			AuxPx(window, 72), AuxPx(window, 30), TRUE);
+		MoveWindow(context->list, AuxPx(window, 16), AuxPx(window, 58), width - AuxPx(window, 32),
+			(std::max)(AuxPx(window, 120), height - AuxPx(window, 180)), TRUE);
+		MoveWindow(context->status, AuxPx(window, 18), height - AuxPx(window, 150),
+			width - AuxPx(window, 36), AuxPx(window, 24), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_LABEL), AuxPx(window, 18), height - AuxPx(window, 112),
+			AuxPx(window, 48), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_NAME), AuxPx(window, 72), height - AuxPx(window, 112),
+			(std::max)(AuxPx(window, 180), width - AuxPx(window, 440)), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_REFRESH), width - AuxPx(window, 350), height - AuxPx(window, 112),
+			AuxPx(window, 78), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_OK), width - AuxPx(window, 256), height - AuxPx(window, 112),
+			AuxPx(window, 88), AuxPx(window, 30), TRUE);
+		MoveWindow(GetDlgItem(window, IDC_LOG_SAVE_CANCEL), width - AuxPx(window, 158), height - AuxPx(window, 112),
+			AuxPx(window, 88), AuxPx(window, 30), TRUE);
 		return 0;
+	}
+	case WM_DPICHANGED: {
+		// 同「录入版本样本」：换屏只换字号和列宽，几何交给 DefWindowProc。
+		HFONT replacement = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+			DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+			DEFAULT_PITCH, L"Microsoft YaHei UI");
+		if (replacement) {
+			if (context->font) DeleteObject(context->font);
+			context->font = replacement;
+			ApplyAuxFont(window, context->font);
+		}
+		ListView_SetColumnWidth(context->list, 0, AuxPx(window, 520));
+		ListView_SetColumnWidth(context->list, 1, AuxPx(window, 120));
+		break;
 	}
 	case WM_COMMAND:
 		switch (LOWORD(wParam)) {
@@ -2845,8 +2917,14 @@ LRESULT CALLBACK LogSavePickerProc(HWND window, UINT message, WPARAM wParam, LPA
 			return 0;
 		}
 		case IDC_LOG_SAVE_REFRESH: NavigateLogSavePicker(context, context->currentDirectory); return 0;
-		case IDC_LOG_SAVE_OK: AcceptLogSavePicker(context); return 0;
-		case IDC_LOG_SAVE_CANCEL: DestroyWindow(window); return 0;
+		case IDC_LOG_SAVE_OK:
+		case IDOK:
+			AcceptLogSavePicker(context);
+			return 0;
+		case IDC_LOG_SAVE_CANCEL:
+		case IDCANCEL:
+			DestroyWindow(window);
+			return 0;
 		}
 		break;
 	case WM_NOTIFY:
@@ -2892,12 +2970,11 @@ bool ChooseLogSavePath(HWND owner, std::wstring* path)
 	LogSavePickerContext context;
 	context.owner = owner;
 	context.initialName = *path;
-	RECT workArea = {};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
+	RECT workArea = AuxWorkArea(owner);
 	RECT ownerRect = workArea;
 	if (owner) GetWindowRect(owner, &ownerRect);
-	const int width = 760;
-	const int height = 540;
+	const int width = AuxPx(owner, 760);
+	const int height = AuxPx(owner, 540);
 	const int x = (std::max)(workArea.left,
 		(std::min)(workArea.right - width, ownerRect.left + (ownerRect.right - ownerRect.left - width) / 2));
 	const int y = (std::max)(workArea.top,
@@ -3032,61 +3109,64 @@ void MediaPickerPaint(MediaPickerContext* context, HDC dc)
 {
 	RECT client{};
 	GetClientRect(context->window, &client);
+	// 这个窗口整块是固定像素画的，没有逻辑坐标系可借。所有字面量都是 96 DPI
+	// 下的数值，统一走 px() 换算 —— 换完仍然是物理像素，命中测试不用反算。
+	const auto px = [window = context->window](int value) { return AuxPx(window, value); };
 	HBRUSH background = CreateSolidBrush(RGB(245, 249, 247));
 	FillRect(dc, &client, background);
 	DeleteObject(background);
 
-	RECT header{ 0, 0, client.right, 72 };
+	RECT header{ 0, 0, client.right, px(72) };
 	HBRUSH headerBrush = CreateSolidBrush(RGB(24, 50, 44));
 	FillRect(dc, &header, headerBrush);
 	DeleteObject(headerBrush);
 	SetBkMode(dc, TRANSPARENT);
 	SetTextColor(dc, RGB(255, 255, 255));
 	HFONT oldTitle = static_cast<HFONT>(SelectObject(dc, context->titleFont));
-	RECT title{ 22, 15, client.right - 22, 40 };
+	RECT title{ px(22), px(15), client.right - px(22), px(40) };
 	DrawTextW(dc, context->image ? L"选择图片" : L"选择视频", -1, &title, DT_SINGLELINE | DT_VCENTER);
 	SelectObject(dc, oldTitle);
 	SetTextColor(dc, RGB(197, 222, 214));
 	HFONT oldFont = static_cast<HFONT>(SelectObject(dc, context->font));
-	RECT subtitle{ 22, 42, client.right - 22, 64 };
+	RECT subtitle{ px(22), px(42), client.right - px(22), px(64) };
 	DrawTextW(dc, context->image ? L"BMP / JPG / PNG" : L"MP4 / WMV / AVI / MOV / MKV", -1, &subtitle, DT_SINGLELINE | DT_VCENTER);
 
-	RECT path{ 22, 90, client.right - 122, 122 };
+	RECT path{ px(22), px(90), client.right - px(122), px(122) };
 	HBRUSH pathBrush = CreateSolidBrush(RGB(255, 255, 255));
 	FillRect(dc, &path, pathBrush);
 	DeleteObject(pathBrush);
 	FrameRect(dc, &path, static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH)));
 	SetTextColor(dc, RGB(53, 67, 62));
-	RECT pathText{ path.left + 10, path.top, path.right - 10, path.bottom };
+	RECT pathText{ path.left + px(10), path.top, path.right - px(10), path.bottom };
 	const wchar_t* location = context->currentDirectory.empty() ? L"此电脑" : context->currentDirectory.c_str();
 	DrawTextW(dc, location, -1, &pathText, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-	context->upRect = { client.right - 108, 90, client.right - 22, 122 };
+	context->upRect = { client.right - px(108), px(90), client.right - px(22), px(122) };
 	MediaPickerDrawButton(dc, context->upRect, L"上一级", false, context->font);
 
-	context->listRect = { 22, 140, client.right - 22, client.bottom - 76 };
+	context->listRect = { px(22), px(140), client.right - px(22), client.bottom - px(76) };
 	HBRUSH listBrush = CreateSolidBrush(RGB(255, 255, 255));
 	FillRect(dc, &context->listRect, listBrush);
 	DeleteObject(listBrush);
 	FrameRect(dc, &context->listRect, static_cast<HBRUSH>(GetStockObject(LTGRAY_BRUSH)));
-	const int rowHeight = 32;
+	const int rowHeight = px(32);
 	const int visibleRows = (std::max)(1, static_cast<int>((context->listRect.bottom - context->listRect.top) / rowHeight));
 	const int first = (std::min)(context->scrollOffset, (std::max)(0, static_cast<int>(context->entries.size()) - visibleRows));
 	context->scrollOffset = first;
 	for (int slot = 0; slot < visibleRows; ++slot) {
 		const int index = first + slot;
 		if (index >= static_cast<int>(context->entries.size())) break;
-		RECT row{ context->listRect.left + 1, context->listRect.top + slot * rowHeight + 1,
-			context->listRect.right - 1, context->listRect.top + (slot + 1) * rowHeight };
+		RECT row{ context->listRect.left + px(1), context->listRect.top + slot * rowHeight + px(1),
+			context->listRect.right - px(1), context->listRect.top + (slot + 1) * rowHeight };
 		if (index == context->selectedIndex) {
 			HBRUSH selectedBrush = CreateSolidBrush(RGB(216, 238, 231));
 			FillRect(dc, &row, selectedBrush);
 			DeleteObject(selectedBrush);
 		}
 		SetTextColor(dc, context->entries[index].directory ? RGB(0, 98, 84) : RGB(53, 67, 62));
-		RECT name{ row.left + 12, row.top, row.right - 110, row.bottom };
+		RECT name{ row.left + px(12), row.top, row.right - px(110), row.bottom };
 		DrawTextW(dc, context->entries[index].name.c_str(), -1, &name, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 		SetTextColor(dc, RGB(112, 125, 120));
-		RECT type{ row.right - 96, row.top, row.right - 12, row.bottom };
+		RECT type{ row.right - px(96), row.top, row.right - px(12), row.bottom };
 		DrawTextW(dc, context->entries[index].directory ? L"文件夹" : L"媒体文件", -1, &type, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
 	}
 	if (context->entries.empty()) {
@@ -3095,12 +3175,12 @@ void MediaPickerPaint(MediaPickerContext* context, HDC dc)
 		DrawTextW(dc, L"此位置没有可选文件", -1, &empty, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 	}
 
-	context->cancelRect = { client.right - 118, client.bottom - 54, client.right - 22, client.bottom - 20 };
-	context->useRect = { client.right - 224, client.bottom - 54, client.right - 128, client.bottom - 20 };
+	context->cancelRect = { client.right - px(118), client.bottom - px(54), client.right - px(22), client.bottom - px(20) };
+	context->useRect = { client.right - px(224), client.bottom - px(54), client.right - px(128), client.bottom - px(20) };
 	MediaPickerDrawButton(dc, context->useRect, L"使用文件", true, context->font);
 	MediaPickerDrawButton(dc, context->cancelRect, L"取消", false, context->font);
 	SetTextColor(dc, RGB(86, 101, 95));
-	RECT hint{ 22, client.bottom - 54, client.right - 238, client.bottom - 20 };
+	RECT hint{ px(22), client.bottom - px(54), client.right - px(238), client.bottom - px(20) };
 	DrawTextW(dc, L"双击文件夹进入，双击媒体文件选择", -1, &hint, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 	SelectObject(dc, oldFont);
 }
@@ -3130,9 +3210,9 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 	if (!context) return DefWindowProcW(window, message, wParam, lParam);
 	switch (message) {
 	case WM_CREATE:
-		context->font = CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		context->font = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-		context->titleFont = CreateFontW(-20, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		context->titleFont = CreateFontW(-AuxPx(window, 20), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
 		{
 			wchar_t modulePath[32768] = {};
@@ -3149,6 +3229,10 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 		EndPaint(window, &paint);
 		return 0;
 	}
+	case WM_KEYDOWN:
+		// 这个窗口没有原生控件，Esc 只能自己接。
+		if (wParam == VK_ESCAPE) { DestroyWindow(window); return 0; }
+		break;
 	case WM_MOUSEWHEEL: {
 		const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
 		context->scrollOffset = (std::max)(0, context->scrollOffset - notches * 3);
@@ -3158,7 +3242,8 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 	case WM_LBUTTONDOWN:
 	case WM_LBUTTONDBLCLK: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-		if (PtInRect(&context->upRect, point)) {
+		// 按钮只认「按下」：双击的第三次消息会再走一遍，双击「上一级」会一次退两级。
+		if (message == WM_LBUTTONDOWN && PtInRect(&context->upRect, point)) {
 			if (context->currentDirectory.empty()) MediaPickerNavigate(context, L"");
 			else if (context->currentDirectory.size() <= 3 && context->currentDirectory[1] == L':') MediaPickerNavigate(context, L"");
 			else {
@@ -3167,10 +3252,11 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 			}
 			return 0;
 		}
-		if (PtInRect(&context->useRect, point)) { MediaPickerAccept(context); return 0; }
-		if (PtInRect(&context->cancelRect, point)) { DestroyWindow(window); return 0; }
+		if (message == WM_LBUTTONDOWN && PtInRect(&context->useRect, point)) { MediaPickerAccept(context); return 0; }
+		if (message == WM_LBUTTONDOWN && PtInRect(&context->cancelRect, point)) { DestroyWindow(window); return 0; }
 		if (PtInRect(&context->listRect, point)) {
-			const int row = (point.y - context->listRect.top) / 32;
+			const int rowHeight = AuxPx(window, 32);
+			const int row = rowHeight > 0 ? (point.y - context->listRect.top) / rowHeight : -1;
 			const int index = context->scrollOffset + row;
 			if (index >= 0 && index < static_cast<int>(context->entries.size())) {
 				context->selectedIndex = index;
@@ -3179,6 +3265,23 @@ LRESULT CALLBACK MediaPickerProc(HWND window, UINT message, WPARAM wParam, LPARA
 			}
 			return 0;
 		}
+		break;
+	}
+	case WM_DPICHANGED: {
+		// 几何全在 WM_PAINT 里按 AuxPx 现算，换屏只要把两档字号换掉。
+		HFONT replacement = CreateFontW(-AuxPx(window, 15), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+		HFONT replacementTitle = CreateFontW(-AuxPx(window, 20), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+			OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+		if (replacement) {
+			if (context->font) DeleteObject(context->font);
+			context->font = replacement;
+		}
+		if (replacementTitle) {
+			if (context->titleFont) DeleteObject(context->titleFont);
+			context->titleFont = replacementTitle;
+		}
+		InvalidateRect(window, nullptr, TRUE);
 		break;
 	}
 	case WM_CLOSE: DestroyWindow(window); return 0;
@@ -3199,8 +3302,8 @@ bool ChooseMediaPath(HWND owner, bool image, std::wstring* path)
 	if (!registered) {
 		WNDCLASSEXW windowClass{};
 		windowClass.cbSize = sizeof(windowClass);
-		// 没有 CS_DBLCLKS 时系统只发两次 WM_LBUTTONDOWN，双击进入文件夹/选文件
-		// 永远不会触发（窗口提示却写着「双击」）。
+		// 列表是自绘的，进入子目录/选中媒体全靠 WM_LBUTTONDBLCLK；
+		// 不注册 CS_DBLCLKS 时系统只发两次 WM_LBUTTONDOWN，双击永远进不去下一级。
 		windowClass.style = CS_DBLCLKS;
 		windowClass.lpfnWndProc = MediaPickerProc;
 		windowClass.hInstance = JTAppGetInstanceDirect();
@@ -3214,21 +3317,21 @@ bool ChooseMediaPath(HWND owner, bool image, std::wstring* path)
 	MediaPickerContext context;
 	context.owner = owner;
 	context.image = image;
-	RECT work{};
-	SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
-	const int width = 720;
-	const int height = 560;
-	const int x = work.left + ((work.right - work.left) - width) / 2;
-	const int y = work.top + ((work.bottom - work.top) - height) / 2;
+	const int width = AuxPx(owner, 720);
+	const int height = AuxPx(owner, 560);
+	const POINT origin = AuxCenterOn(owner, width, height);
 	HWND window = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW | WS_EX_TOPMOST, kMediaPickerClass,
 		image ? L"选择图片" : L"选择视频", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_SIZEBOX,
-		x, y, width, height, owner, nullptr, JTAppGetInstanceDirect(), &context);
+		origin.x, origin.y, width, height, owner, nullptr, JTAppGetInstanceDirect(), &context);
 	if (!window) return false;
 	const BOOL ownerWasEnabled = owner && IsWindowEnabled(owner);
 	if (ownerWasEnabled) EnableWindow(owner, FALSE);
 	ShowWindow(window, SW_SHOW);
 	UpdateWindow(window);
 	SetForegroundWindow(window);
+	// 焦点要落在窗口上：滚轮和键盘都只投给焦点窗口，靠点一下才拿到焦点的话
+	// 打开后先用滚轮是没有反应的。
+	SetFocus(window);
 	MSG message{};
 	while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
 		TranslateMessage(&message);
@@ -3270,10 +3373,21 @@ std::unique_ptr<Bitmap> TeacherBitmapFromFrame(const jiyu::RemoteFrame& frame)
 std::wstring StripMarkup(LPCWSTR input) {
 	std::wstring result;
 	bool inTag = false;
+	bool lineBreak = false;
 	for (const wchar_t* p = input ? input : L""; *p; ++p) {
-		if (*p == L'<') inTag = true;
-		else if (*p == L'>') inTag = false;
-		else if (!inTag) result.push_back(*p);
+		if (*p == L'<') { inTag = true; lineBreak = false; continue; }
+		if (*p == L'>') {
+			inTag = false;
+			// <br> 不能像 <b> 那样直接抹掉。原来「已在此计算机上找到极域电子教室」
+			// 和「你可以点击…」会粘成一句，读起来像漏了标点。
+			if (lineBreak) result.push_back(L'\n');
+			continue;
+		}
+		if (inTag) {
+			if ((*p == L'b' || *p == L'B') && (p[1] == L'r' || p[1] == L'R')) lineBreak = true;
+			continue;
+		}
+		result.push_back(*p);
 	}
 	return result;
 }
@@ -3281,8 +3395,7 @@ std::wstring StripMarkup(LPCWSTR input) {
 struct TeacherWindowSearch {
 	DWORD processId = 0;
 	HWND window = nullptr;
-	// 只有在尝试嵌入/已经嵌入时才隐藏控制台；以独立窗口运行时要留着它，
-	// 否则 Python 版教师端（唯一的交互界面就是控制台）会完全看不见。
+	// 独立运行模式下要把控制台留着给用户看，不能再扫一遍藏起来。
 	bool hideConsole = true;
 };
 
@@ -3297,7 +3410,7 @@ BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
 		return TRUE;
 	// JiYuTeacherGui is a console-subsystem executable. Its console is not part
 	// of the teacher UI and must never become visible beside the embedded FLTK
-	// window, even when it was created before CREATE_NO_WINDOW took effect.
+	// window, even if it ignored the hidden STARTUPINFO show state.
 	if (lstrcmpW(className, L"ConsoleWindowClass") == 0) {
 		if (search->hideConsole) ShowWindow(hwnd, SW_HIDE);
 		return TRUE;
@@ -3307,6 +3420,35 @@ BOOL CALLBACK FindTeacherWindow(HWND hwnd, LPARAM parameter)
 	RECT client{};
 	if (GetClientRect(hwnd, &client) && client.right >= 320 && client.bottom >= 200) {
 		search->window = hwnd;
+	}
+	return TRUE;
+}
+
+struct TeacherStandaloneSearch {
+	DWORD processId = 0;
+	HWND console = nullptr;
+	HWND other = nullptr;
+};
+
+// 没等到 FLTK 窗口时用：优先把控制台翻出来（Python 版只有控制台），
+// 没有控制台就找教师端自己的顶层窗口。只认无主窗口，子窗口不碰。
+BOOL CALLBACK FindStandaloneTeacherWindow(HWND hwnd, LPARAM parameter)
+{
+	auto* search = reinterpret_cast<TeacherStandaloneSearch*>(parameter);
+	if (!search) return TRUE;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(hwnd, &pid);
+	if (pid != search->processId || GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+	wchar_t className[64]{};
+	if (GetClassNameW(hwnd, className, _countof(className)) == 0) return TRUE;
+	if (lstrcmpW(className, L"ConsoleWindowClass") == 0) {
+		if (!search->console) search->console = hwnd;
+		return TRUE;
+	}
+	if (!search->other) {
+		RECT client{};
+		if (GetClientRect(hwnd, &client) && client.right >= 160 && client.bottom >= 80)
+			search->other = hwnd;
 	}
 	return TRUE;
 }
@@ -3378,12 +3520,23 @@ MainWindow::MainWindow()
 	GdiplusStartup(&gdiplusToken, &input, nullptr);
 	if (!RegisterWindowClass()) return;
 
-	const int systemDpi = SystemDpi();
-	dpiScale = systemDpi > 0 ? static_cast<double>(systemDpi) / 96.0 : 1.0;
-	RECT desired{ 0, 0, static_cast<LONG>(1120 * dpiScale), static_cast<LONG>(760 * dpiScale) };
+	// 默认客户区 1120×760 是逻辑像素；真正建窗口时换成当前 DPI 的物理像素。
+	uiScale = static_cast<float>(QueryWindowDpi(nullptr)) / 96.0f;
+	RECT desired{ 0, 0, ToPhysical(1120), ToPhysical(760) };
 	AdjustWindowRectEx(&desired, WS_OVERLAPPEDWINDOW, FALSE, 0);
+	int windowWidth = desired.right - desired.left;
+	int windowHeight = desired.bottom - desired.top;
+	// 150% 的 1080p 上，逻辑 1120×760 换算是 1680×1140，比屏幕还高。
+	// 夹到工作区，宁可让页面内容挤一点，也不要开出来就有一截在屏幕外。
+	RECT work{};
+	if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+		const int workWidth = work.right - work.left;
+		const int workHeight = work.bottom - work.top;
+		if (workWidth > 0) windowWidth = (std::min)(windowWidth, workWidth);
+		if (workHeight > 0) windowHeight = (std::min)(windowHeight, workHeight);
+	}
 	_hWnd = CreateWindowExW(0, MAIN_WND_CLS_NAME, MAIN_WND_NAME, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-		CW_USEDEFAULT, CW_USEDEFAULT, desired.right - desired.left, desired.bottom - desired.top,
+		CW_USEDEFAULT, CW_USEDEFAULT, windowWidth, windowHeight,
 		nullptr, nullptr, JTAppGetInstanceDirect(), this);
 	if (!_hWnd) return;
 
@@ -3392,27 +3545,53 @@ MainWindow::MainWindow()
 	UpdateWindow(_hWnd);
 }
 
+void MainWindow::ApplyDpiChange(int dpi, const RECT* suggested)
+{
+	if (dpi <= 0) return;
+	const float scale = static_cast<float>(dpi) / 96.0f;
+	if (fabsf(scale - uiScale) < 0.001f) return;
+	uiScale = scale;
+	// 建议矩形已经是物理像素、也含非客户区，直接采用，别按逻辑尺寸重推一遍。
+	if (suggested != nullptr) {
+		SetWindowPos(_hWnd, nullptr, suggested->left, suggested->top,
+			suggested->right - suggested->left, suggested->bottom - suggested->top,
+			SWP_NOZORDER | SWP_NOACTIVATE);
+	}
+	// 原生控件用的是像素高度的 HFONT，不重建的话到了新 DPI 下字会小一半。
+	RebuildControlFont();
+	LayoutEmbeddedWindows();
+	PositionProcessPickerSearchEdit();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::PointToLogical(POINT& point) const
+{
+	if (uiScale <= 0.0f || fabsf(uiScale - 1.0f) < 0.001f) return;
+	point.x = static_cast<LONG>(lround(static_cast<double>(point.x) / uiScale));
+	point.y = static_cast<LONG>(lround(static_cast<double>(point.y) / uiScale));
+}
+
+void MainWindow::RebuildControlFont()
+{
+	HFONT font = CreateFontW(-ToPhysical(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+		DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
+	if (font == nullptr) return;
+	HFONT previous = controlFont;
+	controlFont = font;
+	for (HWND control : networkControls)
+		if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	for (HWND control : advancedControls)
+		if (control) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	if (processPickerSearchEdit)
+		SendMessageW(processPickerSearchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	if (teacherLaunchButton)
+		SendMessageW(teacherLaunchButton, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	if (previous) DeleteObject(previous);
+}
+
 // 切换浅色/深色。fromSystem = true 表示这是系统设置变更触发的，
 // 手动选过主题之后就不该再被系统顶掉；fromSystem = false 表示用户点了主题按钮。
-int MainWindow::SystemDpi() const
-{
-	HDC dc = GetDC(nullptr);
-	const int dpi = dc ? GetDeviceCaps(dc, LOGPIXELSX) : 96;
-	if (dc) ReleaseDC(nullptr, dc);
-	return dpi > 0 ? dpi : 96;
-}
-
-int MainWindow::Scale(int value) const
-{
-	return static_cast<int>(lround(static_cast<double>(value) * dpiScale));
-}
-
-POINT MainWindow::ToLogical(POINT point) const
-{
-	if (dpiScale <= 0.0) return point;
-	return POINT{ static_cast<LONG>(lround(point.x / dpiScale)), static_cast<LONG>(lround(point.y / dpiScale)) };
-}
-
 void MainWindow::ApplyTheme(bool dark, bool fromSystem)
 {
 	if (fromSystem && !themeFollowsSystem) return;
@@ -3427,6 +3606,8 @@ void MainWindow::ApplyTheme(bool dark, bool fromSystem)
 	advancedFieldBrush = CreateSolidBrush(dark ? RGB(26, 33, 30) : RGB(255, 255, 255));
 	if (processPickerFieldBrush) DeleteObject(processPickerFieldBrush);
 	processPickerFieldBrush = CreateSolidBrush(dark ? RGB(26, 33, 30) : RGB(255, 255, 255));
+	if (feedbackFieldBrush) DeleteObject(feedbackFieldBrush);
+	feedbackFieldBrush = CreateSolidBrush(dark ? RGB(38, 45, 42) : RGB(243, 247, 245));
 	for (HWND control : networkControls) if (control) InvalidateRect(control, nullptr, TRUE);
 	for (HWND control : advancedControls) if (control) InvalidateRect(control, nullptr, TRUE);
 	if (processPickerSearchEdit) InvalidateRect(processPickerSearchEdit, nullptr, TRUE);
@@ -3448,6 +3629,7 @@ MainWindow::~MainWindow()
 	if (controlSurfaceBrush) DeleteObject(controlSurfaceBrush);
 	if (advancedFieldBrush) DeleteObject(advancedFieldBrush);
 	if (processPickerFieldBrush) DeleteObject(processPickerFieldBrush);
+	if (feedbackFieldBrush) DeleteObject(feedbackFieldBrush);
 	if (controlFont) DeleteObject(controlFont);
 	ReleaseBackBuffer();
 	// Member destructors run AFTER this body, so every object holding a GDI+ type
@@ -3709,36 +3891,35 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		self->LayoutEmbeddedWindows();
 		// 搜索框是原生子窗口，几何跟着卡片走，缩放时要跟着挪。
 		self->PositionProcessPickerSearchEdit();
+		self->PositionFeedbackEdits();
 		InvalidateRect(hwnd, nullptr, FALSE);
 		return 0;
 	}
 	case WM_GETMINMAXINFO: {
 		auto info = reinterpret_cast<MINMAXINFO*>(lParam);
-		info->ptMinTrackSize = { self->Scale(960), self->Scale(760) };
-		return 0;
-	}
-	case WM_APP + 71: {   // 教师端内置控制台输出
-		auto* text = reinterpret_cast<std::wstring*>(lParam);
-		if (text) {
-			self->AppendTeacherConsole(*text);
-			delete text;
+		// 和默认客户区一样按逻辑像素写，换算成物理像素交给系统。
+		int minWidth = self->ToPhysical(960);
+		int minHeight = self->ToPhysical(760);
+		// 高缩放下这两个值可能超过屏幕（150% 时最小高就是 1140），窗口会被
+		// 顶到屏幕外、底部永远看不见。上限夹到当前显示器工作区。
+		MONITORINFO monitor{};
+		monitor.cbSize = sizeof(monitor);
+		if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &monitor)) {
+			const int workWidth = monitor.rcWork.right - monitor.rcWork.left;
+			const int workHeight = monitor.rcWork.bottom - monitor.rcWork.top;
+			if (workWidth > 0) minWidth = (std::min)(minWidth, workWidth);
+			if (workHeight > 0) minHeight = (std::min)(minHeight, workHeight);
 		}
+		info->ptMinTrackSize = { minWidth, minHeight };
 		return 0;
 	}
 	case WM_DPICHANGED: {
-		const UINT newDpi = HIWORD(wParam);
-		if (newDpi != 0) self->dpiScale = static_cast<double>(newDpi) / 96.0;
-		const RECT* suggested = reinterpret_cast<const RECT*>(lParam);
-		if (suggested) {
-			SetWindowPos(hwnd, nullptr, suggested->left, suggested->top,
-				suggested->right - suggested->left, suggested->bottom - suggested->top,
-				SWP_NOZORDER | SWP_NOACTIVATE);
-		}
-		InvalidateRect(hwnd, nullptr, FALSE);
+		self->ApplyDpiChange(HIWORD(wParam), reinterpret_cast<const RECT*>(lParam));
 		return 0;
 	}
 	case WM_MOUSEMOVE: {
-		POINT point = self->ToLogical(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		self->PointToLogical(point);
 		self->UpdateHover(point);
 		if (!self->mouseTracking) {
 			TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, hwnd, 0 };
@@ -3757,7 +3938,7 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 	case WM_MOUSEWHEEL: {
 		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		ScreenToClient(hwnd, &point);
-		point = self->ToLogical(point);
+		self->PointToLogical(point);
 		if (self->ProcessPickerVisible()) {
 			const int notches = GET_WHEEL_DELTA_WPARAM(wParam) / WHEEL_DELTA;
 			const int rows = (std::max)(1, self->processPicker.rowCount);
@@ -3798,9 +3979,26 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		break;
 	case WM_LBUTTONDOWN: {
 		// 只是记住按下的目标，用来给按钮画"按下去"的样子；真正的动作仍在抬起时执行。
-		POINT point = self->ToLogical(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		self->PointToLogical(point);
 		if (self->ProcessPickerVisible()) {
 			self->pressTarget = self->HitProcessPickerAt(point);
+			if (self->pressTarget >= 0) {
+				self->EnsureAnimationTimer();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+		}
+		if (self->FeedbackDialogVisible()) {
+			self->pressTarget = self->HitFeedbackDialogAt(point);
+			if (self->pressTarget >= 0) {
+				self->EnsureAnimationTimer();
+				InvalidateRect(hwnd, nullptr, FALSE);
+			}
+			return 0;
+		}
+		if (self->ProtectDialogVisible()) {
+			self->pressTarget = self->HitProtectDialogAt(point);
 			if (self->pressTarget >= 0) {
 				self->EnsureAnimationTimer();
 				InvalidateRect(hwnd, nullptr, FALSE);
@@ -3824,7 +4022,8 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		return 0;
 	}
 	case WM_LBUTTONUP: {
-		POINT point = self->ToLogical(POINT{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) });
+		POINT point{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		self->PointToLogical(point);
 		self->HandleClick(point);
 		self->pressTarget = -1;
 		self->EnsureAnimationTimer();
@@ -3841,6 +4040,38 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 				return 0;
 			}
 			self->HandleProcessPickerKey(message, wParam);
+			return 0;
+		}
+		// 反馈弹窗里焦点一般在 EDIT 上，那边自己处理 Esc；这条是焦点
+		// 停在按钮上时的兜底。
+		if (self->FeedbackDialogVisible()) {
+			if (wParam == VK_ESCAPE) {
+				self->CloseFeedbackDialog();
+				return 0;
+			}
+			if (wParam == VK_TAB) {
+				// 焦点落在主窗口上，说明停在按钮那两站；站号接在输入框后面。
+				const int from = self->focusTarget == kFeedbackSubmit ? 3 : 4;
+				self->CycleFeedbackFocus(from, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+				return 0;
+			}
+			if (wParam == VK_RETURN || wParam == VK_SPACE) {
+				if (self->focusTarget == kFeedbackSubmit) self->SubmitFeedback();
+				else if (self->focusTarget == kFeedbackCancel) self->CloseFeedbackDialog();
+				return 0;
+			}
+			return 0;
+		}
+		// 防护信息面板只有一个「关闭」，Esc 和回车都当关掉。
+		if (self->ProtectDialogVisible()) {
+			if (wParam == VK_ESCAPE || wParam == VK_RETURN || wParam == VK_SPACE) {
+				self->CloseProtectDialog();
+				return 0;
+			}
+			if (wParam == VK_TAB) {
+				self->MoveFocus((GetKeyState(VK_SHIFT) & 0x8000) != 0);
+				return 0;
+			}
 			return 0;
 		}
 		// 录制快捷键时，主键先归这里，别让 DefWindowProc 抢去（Alt 会拉系统菜单）。
@@ -3909,6 +4140,13 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		HDC controlDc = reinterpret_cast<HDC>(wParam);
 		// 高级配置页的输入框要跟自绘的圆角框同色，否则控件那块方底色会顶出来。
 		const int controlId = GetDlgCtrlID(reinterpret_cast<HWND>(lParam));
+		if (controlId == kFeedbackDescEdit || controlId == kFeedbackReproEdit ||
+			controlId == kFeedbackContactEdit) {
+			SetTextColor(controlDc, self->darkMode ? RGB(232, 238, 235) : RGB(26, 30, 28));
+			SetBkColor(controlDc, self->darkMode ? RGB(38, 45, 42) : RGB(243, 247, 245));
+			if (!self->feedbackFieldBrush) break;
+			return reinterpret_cast<LRESULT>(self->feedbackFieldBrush);
+		}
 		if (controlId == kProcessPickerSearch) {
 			// 搜索框的方底色必须和自绘的圆角填充一模一样，否则圆角里会露出一个白/灰方块。
 			SetTextColor(controlDc, self->darkMode ? RGB(232, 238, 235) : RGB(26, 30, 28));
@@ -3994,6 +4232,45 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 		return 0;
 	}
 	case WM_MY_SCAN_IP_FINISH: self->AppendNetworkResult(L"\u5c40\u57df\u7f51\u626b\u63cf\u5b8c\u6210"); return 0;
+	case WM_QUERYENDSESSION: {
+		// 只要不是电源菜单发起的关机，一律投否决票 —— 极域远程关机、别的程序
+		// 调 ExitWindowsEx 都会走到这里。返回 FALSE 之后系统会撤掉这次关机，
+		// 并在关机界面上显示下面这句原因。ENDSESSION_CRITICAL 是系统自己
+		// 要关（更新重启之类），拦也拦不住，别白拦。
+		//
+		// 这一层只能挡住**没带 EWX_FORCE** 的关机。教师端的关机基本都带 force，
+		// 那时系统照样结束进程、照样关 —— 2026-11-21 那次「拦截没成功」就是这个
+		// 原因：日志里有 Blocked，机器还是关了。真正拦住的是 Hooks 里在
+		// ExitWindowsEx / InitiateSystemShutdownEx 上做的那组（blockShutdown）。
+		// 这里保留，是因为开始菜单、计划任务这些走的是正常协商路径。
+		if (self->allowShutdown || (lParam & ENDSESSION_CRITICAL) != 0) return TRUE;
+		ShutdownBlockReasonCreate(hwnd, L"Dzjs Trainer \u5df2\u62e6\u622a\u672c\u6b21\u5173\u673a\u8bf7\u6c42");
+		// InitiateSystemShutdownEx 起的关机可以用 AbortSystemShutdown 撤掉；
+		// 对普通 ExitWindowsEx 会报「没有正在进行的关机」，无害。
+		AbortSystemShutdownW(nullptr);
+		PostMessageW(hwnd, WM_MY_SHUTDOWN_BLOCKED, (lParam & ENDSESSION_LOGOFF) ? 1 : 0, 0);
+		return FALSE;
+	}
+	case WM_ENDSESSION:
+		// wParam 为 FALSE 表示关机被取消了，原因文本要跟着撤掉，否则下次
+		// 关机屏幕上会挂一句过期的话。
+		if (!wParam) ShutdownBlockReasonDestroy(hwnd);
+		return 0;
+	case WM_MY_FEEDBACK_DONE:
+		self->OnFeedbackSubmitted();
+		return 0;
+	case WM_MY_SHUTDOWN_BLOCKED: {
+		const bool logoff = wParam != 0;
+		if (self->currentLogger) {
+			self->currentLogger->LogWarn(logoff ? L"Blocked a logoff request from another process"
+				: L"Blocked a shutdown/restart request from another process");
+		}
+		if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_SHOW);
+		SetForegroundWindow(hwnd);
+		self->ShowFastTip(logoff ? L"\u5df2\u62e6\u622a\u6ce8\u9500\u8bf7\u6c42\uff1b\u8981\u6ce8\u9500\u8bf7\u5148\u9000\u51fa Dzjs Trainer"
+			: L"\u5df2\u62e6\u622a\u5173\u673a\u8bf7\u6c42\uff1b\u8981\u5173\u673a\u8bf7\u7528 \u7535\u6e90\u63a7\u5236");
+		return 0;
+	}
 	case WM_CLOSE:
 		if (!self->closeButtonClickPending) return 0;
 		self->closeButtonClickPending = false;
@@ -4078,39 +4355,40 @@ void MainWindow::Paint()
 	}
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	const int width = client.right;
-	const int height = client.bottom;
-	if (width <= 0 || height <= 0 || !EnsureBackBuffer(width, height)) {
+	// 位图按物理像素建，绘制坐标按逻辑像素给，两者之间只差这一次 ScaleTransform。
+	// 于是所有 Paint* 里的硬编码数字不用改，125% / 150% 下自动等比放大。
+	const int pixelWidth = client.right;
+	const int pixelHeight = client.bottom;
+	if (pixelWidth <= 0 || pixelHeight <= 0 || !EnsureBackBuffer(pixelWidth, pixelHeight)) {
 		EndPaint(_hWnd, &ps);
 		return;
 	}
 	Graphics g(backBuffer);
-	// 逻辑坐标 → 物理像素。下面所有绘制仍按 96 DPI 的常量写。
-	g.ScaleTransform(static_cast<REAL>(dpiScale), static_cast<REAL>(dpiScale));
 	g.SetSmoothingMode(SmoothingModeAntiAlias);
 	// ClearType assumes an opaque target; the ARGB back buffer needs alpha-safe antialiasing.
 	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 	// 三层表面明度：侧栏 (226,234,230) 低于 画布 (237,242,239) 低于 卡片 (255,255,255)。
 	// 原来画布 (246,248,246) 与白卡只差 9 级，卡片完全浮不起来。
 	g.Clear(C(darkMode, 237, 242, 239, 15, 18, 17));
+	if (fabsf(uiScale - 1.0f) > 0.001f) g.ScaleTransform(uiScale, uiScale);
+	const int width = ToLogical(pixelWidth);
+	const int height = ToLogical(pixelHeight);
 
 	PaintNavigation(g, height);
 	PaintHeader(g, width);
-	const int logicalWidth = static_cast<int>(lround(width / dpiScale));
-	const int logicalHeight = static_cast<int>(lround(height / dpiScale));
 	const double easedMotion = 1.0 - pow(1.0 - pageMotion, 4.0);
 	const int offset = static_cast<int>((1.0 - easedMotion) * 22.0);
 	switch (page) {
-	case Page::Overview: PaintOverview(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Protection: PaintProtection(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Replacement: PaintProtection(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Antivirus: PaintAntivirus(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Advanced: PaintAdvanced(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Network: PaintNetwork(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Diagnostics: PaintDiagnostics(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Logs: PaintLogs(g, logicalWidth, logicalHeight, offset); break;
-	case Page::About: PaintAbout(g, logicalWidth, logicalHeight, offset); break;
-	case Page::Injection: PaintInjection(g, logicalWidth, logicalHeight, offset); break;
+	case Page::Overview: PaintOverview(g, width, height, offset); break;
+	case Page::Protection: PaintProtection(g, width, height, offset); break;
+	case Page::Replacement: PaintProtection(g, width, height, offset); break;
+	case Page::Antivirus: PaintAntivirus(g, width, height, offset); break;
+	case Page::Advanced: PaintAdvanced(g, width, height, offset); break;
+	case Page::Network: PaintNetwork(g, width, height, offset); break;
+	case Page::Diagnostics: PaintDiagnostics(g, width, height, offset); break;
+	case Page::Logs: PaintLogs(g, width, height, offset); break;
+	case Page::About: PaintAbout(g, width, height, offset); break;
+	case Page::Injection: PaintInjection(g, width, height, offset); break;
 	}
 	// 键盘焦点环。只在 Tab 导航时出现，鼠标点击会清掉。
 	// 更新弹窗有自己的一套焦点环（画在卡片里），这里跳过，免得环被卡片盖住。
@@ -4124,13 +4402,15 @@ void MainWindow::Paint()
 			StrokeRound(g, ring, ringRadius, C(darkMode, 0, 107, 95, 130, 213, 199), 2.0f);
 		}
 	}
-	PaintToast(g, logicalWidth, logicalHeight);
+	PaintToast(g, width, height);
 	// 弹窗画在最后：提示条、页面内容、焦点环都得在它下面。
-	PaintUpdateDialog(g, logicalWidth, logicalHeight);
-	PaintProcessPicker(g, logicalWidth, logicalHeight);
+	PaintUpdateDialog(g, width, height);
+	PaintProtectDialog(g, width, height);
+	PaintFeedbackDialog(g, width, height);
+	PaintProcessPicker(g, width, height);
 	// 直接 BitBlt 到窗口 DC：比 Graphics::DrawImage 快约 45 倍。
 	// BeginPaint 拿到的 DC 已经按更新区裁剪，被子控件挡住的部分不会覆盖。
-	BitBlt(dc, 0, 0, width, height, backBufferDc, 0, 0, SRCCOPY);
+	BitBlt(dc, 0, 0, pixelWidth, pixelHeight, backBufferDc, 0, 0, SRCCOPY);
 	EndPaint(_hWnd, &ps);
 	LARGE_INTEGER paintEnded{};
 	QueryPerformanceCounter(&paintEnded);
@@ -4304,6 +4584,23 @@ void MainWindow::PaintPrimaryButton(Graphics& g, const RectF& rect, LPCWSTR labe
 	PaintButton(g, rect, label, hoverId, ButtonStyle::Primary, radius);
 }
 
+void MainWindow::SyncTopmostKeepTimer()
+{
+	// 只有「普通置顶」需要这个循环：它只是把自己的窗口设成 topmost，别人
+	// 同样设了 topmost（极域广播、前台强制上浮）就能盖上来，只能靠不停地
+	// 重新置顶把位置抢回来。超级置顶是 UIAccess 的窗口带，本身就压得住，
+	// 再跑一遍反而是白费。
+	const bool wanted = setTopMost && !topMostUiAccessBand;
+	if (wanted == topmostKeepTimerRunning) return;
+	if (wanted) {
+		topmostKeepTimerRunning = SetTimer(_hWnd, TIMER_TOPMOST_KEEP, 50, nullptr) != 0;
+	}
+	else {
+		KillTimer(_hWnd, TIMER_TOPMOST_KEEP);
+		topmostKeepTimerRunning = false;
+	}
+}
+
 void MainWindow::RequestSuperTopmost()
 {
 	const bool currentlyEnabled = setTopMost && IsWindowActuallyTopmost(_hWnd);
@@ -4315,6 +4612,7 @@ void MainWindow::RequestSuperTopmost()
 		setTopMost = false;
 		topMostUiAccessBand = false;
 		SaveSettings();
+		SyncTopmostKeepTimer();
 		ShowFastTip(L"\u5df2\u53d6\u6d88\u7f6e\u9876");
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
@@ -4347,6 +4645,7 @@ void MainWindow::RequestSuperTopmost()
 	setTopMost = true;
 	topMostUiAccessBand = bandApplied;
 	SaveSettings();
+	SyncTopmostKeepTimer();
 	ShowFastTip(bandApplied ? L"\u5df2\u542f\u7528\u8d85\u7ea7\u7f6e\u9876" : L"\u5df2\u542f\u7528\u666e\u901a\u7f6e\u9876");
 	InvalidateRect(_hWnd, nullptr, FALSE);
 }
@@ -4370,8 +4669,18 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	const float badgeY = top + 29;
 	FillRound(g, RectF(badgeX, badgeY, 120, 112), 20, primary);
 	DrawIcon(g, 1, badgeX + 46, badgeY + 18, onPrimary, 28);
-	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : L"\u5f85\u68c0\u6d4b", badgeX + 8, badgeY + 56, 104, 26, 15, FontStyleBold, onPrimary, StringAlignmentCenter);
-	Text(g, studentRunning ? L"StudentMain" : L"\u8fdb\u7a0b\u672a\u8fd0\u884c", badgeX + 8, badgeY + 84, 104, 18, 10, FontStyleRegular, onPrimary, StringAlignmentCenter);
+	// 极域没起来、但其他教室的学生端已经接管时，这里再写「待检测 / 进程未运行」
+	// 就是在骗人：防护其实在工作，只是对象换了一个。
+	const bool eduOnly = !studentRunning && eduHostCount > 0;
+	// 进程在跑、还没轮到接管（守护进程刚把它拉起来，或者自动接管被关掉）。
+	// 工作线程在这时候把产品名放进 summary，count 仍是 0。
+	const bool eduPending = !studentRunning && eduHostCount == 0 && !eduHostSummary.empty();
+	WCHAR eduBadge[32] = {};
+	if (eduOnly) swprintf_s(eduBadge, L"\u5176\u4ed6\u6559\u5ba4 %d \u4e2a", eduHostCount);
+	Text(g, studentRunning ? L"\u5df2\u8fde\u63a5" : (eduOnly ? L"\u5df2\u63a5\u7ba1" : (eduPending ? L"\u5f85\u63a5\u7ba1" : L"\u5f85\u68c0\u6d4b")),
+		badgeX + 8, badgeY + 56, 104, 26, 15, FontStyleBold, onPrimary, StringAlignmentCenter);
+	Text(g, studentRunning ? L"StudentMain" : (eduOnly ? eduBadge : (eduPending ? L"\u8fdb\u7a0b\u5728\u8fd0\u884c" : L"\u8fdb\u7a0b\u672a\u8fd0\u884c")),
+		badgeX + 8, badgeY + 84, 104, 18, 10, FontStyleRegular, onPrimary, StringAlignmentCenter);
 
 	const float gap = 12.0f;
 	const float cardW = (contentW - gap * 2) / 3.0f;
@@ -4384,12 +4693,25 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	}
 	Text(g, L"\u9632\u62a4\u72b6\u6001", contentX + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
 	Text(g, currentControlled ? L"\u5b8c\u6574\u9632\u62a4" : L"\u6b63\u5728\u76d1\u63a7", contentX + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	// 这张卡原来只写极域，装了其他教室的机器会一直显示「未运行」，看着像没生效。
+	// 现在把两边合在一起：有极域就给 PID，没有就报其他教室的数量，下面一行补产品名。
 	wchar_t pidText[64];
 	swprintf_s(pidText, L"PID  %lu", static_cast<unsigned long>(studentPid));
-	Text(g, L"\u5b66\u751f\u7aef\u8fdb\u7a0b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, studentRunning ? pidText : L"\u672a\u8fd0\u884c", contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 28, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
-	Text(g, L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
-	Text(g, studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	Text(g, L"\u53d7\u63a7\u5bbf\u4e3b", contentX + cardW + gap + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	const wchar_t* hostValue = studentRunning ? pidText
+		: (eduHostCount > 0 ? L"\u5176\u4ed6\u6559\u5ba4"
+			: (eduPending ? L"\u5f85\u63a5\u7ba1" : L"\u672a\u8fd0\u884c"));
+	Text(g, hostValue, contentX + cardW + gap + 18, metricsY + 42, cardW - 32, 26, 16, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
+	if (eduHostCount > 0 || eduPending) {
+		Text(g, eduHostSummary.c_str(), contentX + cardW + gap + 18, metricsY + 70, cardW - 34, 16, 9,
+			FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	}
+	// 只装了别家教室的机器上极域路径是空的，这张卡原来就那么空着。
+	// 有宿主接管时改报产品名，三张卡才都说得上话。
+	const bool hasJiYuPath = !studentPath.empty() && studentPath != L"\u672a\u68c0\u6d4b\u5230";
+	const bool showProducts = !hasJiYuPath && (eduHostCount > 0 || eduPending);
+	Text(g, showProducts ? L"\u53d7\u63a7\u4ea7\u54c1" : L"\u68c0\u6d4b\u8def\u5f84", contentX + (cardW + gap) * 2 + 18, metricsY + 15, cardW - 32, 18, 11, FontStyleRegular, C(darkMode, 91, 97, 94, 169, 179, 174));
+	Text(g, showProducts ? eduHostSummary.c_str() : studentPath.c_str(), contentX + (cardW + gap) * 2 + 18, metricsY + 40, cardW - 34, 38, 11, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 
 	const float actionsY = metricsY + 110;
 	const float actionGap = 12.0f;
@@ -4403,7 +4725,9 @@ void MainWindow::PaintOverview(Graphics& g, int width, int height, int offsetY)
 	StrokeRound(g, RectF(contentX, actionsY, contentW, actionsH), 12, C(darkMode, 236, 241, 238, 45, 53, 49));
 	Text(g, L"\u5feb\u6377\u64cd\u4f5c", contentX + 20, actionsY + 18, 180, 24, 14, FontStyleBold, C(darkMode, 24, 30, 27, 226, 233, 229));
 	Text(g, L"\u5e38\u7528\u7684\u8fd0\u884c\u63a7\u5236\u548c\u8bbe\u5907\u5de5\u5177", contentX + 20, actionsY + 44, 340, 18, 10, FontStyleRegular, C(darkMode, 91, 99, 95, 166, 177, 171));
-	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", studentRunning ? L"\u7ed3\u675f\u6781\u57df" : L"\u91cd\u542f\u6781\u57df", L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
+	// 这一格不写「结束」也不写「重启」：它既是结束也是启动，写哪一半都会让
+	// 另一半像是坏掉了。点开之后按当前在跑的是谁决定能点什么。
+	const wchar_t* labels[] = { L"\u9632\u62a4\u72b6\u6001", setTopMost ? L"\u53d6\u6d88\u7f6e\u9876" : L"\u5f00\u542f\u7f6e\u9876", L"\u7535\u5b50\u6559\u5ba4\u64cd\u4f5c", L"\u63a7\u5236\u4e0e\u8bbe\u7f6e", L"\u7535\u6e90\u63a7\u5236" };
 	const float actionY = actionsY + 64.0f;
 	for (int i = 0; i < 5; ++i) {
 		const float x = contentX + 20 + i * (actionW + actionGap);
@@ -5072,12 +5396,54 @@ void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int
 	const Color titleColor = C(darkMode, 42, 49, 46, 220, 229, 225);
 	const Color secondary = C(darkMode, 98, 106, 102, 159, 171, 165);
 	const Color hairline = C(darkMode, 226, 234, 229, 44, 52, 48);
+	// 宿主数量由工作线程回调写入，绘制前拷一份，免得 wstring 读到一半被改。
+	bool eduOn = true;
+	int eduCount = 0;
+	std::wstring eduSummary;
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		eduOn = eduCompatAutoInject;
+		eduCount = eduHostCount;
+		eduSummary = eduHostSummary;
+	}
 	SoftShadow(g, RectF(x, y, w, h), 12, darkMode);
 	FillRound(g, RectF(x, y, w, h), 12, C(darkMode, 255, 255, 255, 33, 40, 37));
-	Text(g, L"\u81ea\u5b9a\u4e49\u8fdb\u7a0b\u6ce8\u5165", x + 24, y + 22, w - 48, 26, 15, FontStyleBold, titleColor);
+	Text(g, L"\u8fdb\u7a0b\u6ce8\u5165\u4e0e\u7535\u5b50\u6559\u5ba4", x + 24, y + 22, w - 48, 26, 15, FontStyleBold, titleColor);
 	Text(g, L"\u628a hooks DLL \u6ce8\u5165\u5230\u4f60\u9009\u4e2d\u7684\u8fdb\u7a0b\uff1a\u70b9\u4e0b\u65b9\u6309\u94ae\u4f1a\u6253\u5f00\u8fdb\u7a0b\u5217\u8868\uff0c\u6309\u540d\u79f0\u6216 PID \u8fc7\u6ee4\u540e\u9009\u4e2d\u5373\u53ef\uff0c32 / 64 \u4f4d\u81ea\u52a8\u8bc6\u522b\u3002", x + 24, y + 54, w - 48, 22, 11, FontStyleRegular, secondary);
 	Text(g, L"\u9ed8\u8ba4\u88c5 34 \u9879\u6709\u5e8f\u8868\uff1bini [CustomInject] Mode=minimal \u53ef\u8df3\u8fc7\u6781\u57df\u4e13\u5c5e\u94a9\u5b50\u3002\u7cfb\u7edf\u5173\u952e\u8fdb\u7a0b\u4e5f\u53ef\u9009\uff0c\u6807\u300c\u7cfb\u7edf\u300d\u4ec5\u4f5c\u63d0\u793a\u3002", x + 24, y + 78, w - 48, 22, 11, FontStyleRegular, secondary);
-	const float by = y + 116;
+
+	// 自动接管开关。以前只能改 ini 的 EduCompatAutoInject，界面上没有入口，
+	// 用户既不知道程序会自己往别的教室进程里注东西，也没法关掉。
+	{
+		const float cardX = x + 24;
+		const float cardY = y + 108;
+		const float cardW = w - 48;
+		eduCompatToggleRect = { static_cast<LONG>(cardX), static_cast<LONG>(cardY),
+			static_cast<LONG>(cardX + cardW), static_cast<LONG>(cardY + 64) };
+		FillRound(g, RectF(cardX, cardY, cardW, 64), 12,
+			Blend(C(darkMode, 248, 251, 249, 31, 37, 35),
+				C(darkMode, 220, 237, 231, 49, 63, 58), hoverProgress[113]));
+		Text(g, L"\u81ea\u52a8\u63a5\u7ba1\u5176\u4ed6\u7535\u5b50\u6559\u5ba4", cardX + 16, cardY + 10, cardW - 100, 20, 11,
+			FontStyleBold, titleColor);
+		std::wstring detail;
+		if (!eduOn)
+			detail = L"\u5df2\u5173\u95ed\uff1a\u4e0d\u4f1a\u81ea\u52a8\u6ce8\u5165\u65b0\u8fdb\u7a0b\uff0c\u4e0b\u9762\u7684\u624b\u52a8\u6ce8\u5165\u4e0d\u53d7\u5f71\u54cd";
+		else if (!eduSummary.empty())
+			detail = eduCount > 0 ? (L"\u5f53\u524d\u5df2\u63a5\u7ba1 " + eduSummary)
+				: (L"\u68c0\u6d4b\u5230 " + eduSummary + L" \u5728\u8fd0\u884c\uff0c\u7b49\u5f85\u63a5\u7ba1");
+		else
+			detail = L"\u8bc6\u522b\u5230 \u4f3d\u5361\u4ed6\u5361 / \u7ea2\u8718\u86db / \u8054\u60f3\u4f20\u5947 \u5b66\u751f\u7aef\u65f6\u81ea\u52a8\u6ce8\u5165\uff0c\u4e0d\u7528\u624b\u52a8\u9009";
+		Text(g, detail.c_str(), cardX + 16, cardY + 36, cardW - 100, 17, 10, FontStyleRegular, secondary);
+		const float knobMotion = AnimateToggle(20, eduOn);
+		FillRound(g, RectF(cardX + cardW - 60, cardY + 19, 44, 26), 13,
+			Blend(C(darkMode, 116, 124, 120, 97, 108, 103),
+				C(darkMode, 0, 107, 95, 130, 213, 199), knobMotion));
+		SolidBrush knob(Blend(C(darkMode, 245, 247, 245, 219, 225, 222),
+			C(darkMode, 255, 255, 255, 0, 55, 49), knobMotion));
+		g.FillEllipse(&knob, RectF(cardX + cardW - (56.0f - knobMotion * 18.0f), cardY + 23, 18, 18));
+	}
+
+	const float by = y + 188;
 	const float bw = 150.0f;
 	const wchar_t* labels[] = { L"\u6ce8\u5165\u5230\u6307\u5b9a\u8fdb\u7a0b", L"\u5378\u8f7d", L"\u5237\u65b0\u5217\u8868" };
 	for (int i = 0; i < 3; ++i) {
@@ -5087,9 +5453,9 @@ void MainWindow::PaintInjection(Gdiplus::Graphics& g, int width, int height, int
 		PaintButton(g, RectF(bx, by, bw, 40), labels[i], 110 + i,
 			i == 1 ? ButtonStyle::Danger : (i == 0 ? ButtonStyle::Primary : ButtonStyle::Tonal), 10.0f);
 	}
-	Text(g, customInjectStatus.c_str(), x + 24, y + 172, w - 48, 24, 11, FontStyleBold, titleColor);
-	const float listY = y + 206;
-	const float listH = (std::max)(120.0f, h - 240.0f);
+	Text(g, customInjectStatus.c_str(), x + 24, y + 244, w - 48, 24, 11, FontStyleBold, titleColor);
+	const float listY = y + 278;
+	const float listH = (std::max)(110.0f, h - 312.0f);
 	FillRound(g, RectF(x + 24, listY, w - 48, listH), 12, surface);
 	StrokeRound(g, RectF(x + 24, listY, w - 48, listH), 12, hairline);
 	const std::wstring list = customInjectList.empty()
@@ -5190,18 +5556,14 @@ void MainWindow::PositionProcessPickerSearchEdit()
 	if (!processPickerSearchEdit || !ProcessPickerVisible()) return;
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	// 绘制用逻辑坐标再整体 ScaleTransform，这里必须换算成物理像素，
-	// 否则 150% 缩放下原生 EDIT 会落在自绘卡片左上角。
-	const double scale = dpiScale > 0 ? dpiScale : 1.0;
-	const PickerGeometry geom = ComputePickerGeometry(
-		static_cast<int>(client.right / scale), static_cast<int>(client.bottom / scale));
+	const PickerGeometry geom = ComputePickerGeometry(ToLogical(client.right), ToLogical(client.bottom));
 	RECT target{};
-	target.left = Scale(static_cast<int>(geom.search.X));
-	target.top = Scale(static_cast<int>(geom.search.Y));
-	target.right = Scale(static_cast<int>(geom.search.GetRight()));
-	target.bottom = Scale(static_cast<int>(geom.search.GetBottom()));
-	// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 7 逻辑像素，贴边会把圆角削掉。
-	InflateRect(&target, -Scale(10), -Scale(7));
+	target.left = ToPhysical(static_cast<int>(geom.search.X));
+	target.top = ToPhysical(static_cast<int>(geom.search.Y));
+	target.right = ToPhysical(static_cast<int>(geom.search.GetRight()));
+	target.bottom = ToPhysical(static_cast<int>(geom.search.GetBottom()));
+	// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 7 像素，贴边会把圆角削掉。
+	InflateRect(&target, -ToPhysical(10), -ToPhysical(7));
 	RECT current{};
 	GetWindowRect(processPickerSearchEdit, &current);
 	MapWindowPoints(HWND_DESKTOP, _hWnd, reinterpret_cast<POINT*>(&current), 2);
@@ -6563,6 +6925,11 @@ void MainWindow::PaintAbout(Graphics& g, int width, int height, int offsetY)
 	Text(g, L"\u4f7f\u7528\u63d0\u793a", x + 64, y + 468, 120, 22, 12, FontStyleBold, C(darkMode, 91, 66, 0, 255, 220, 141));
 	Text(g, L"\u8bf7\u4ec5\u5728\u5408\u6cd5\u3001\u6388\u6743\u7684\u73af\u5883\u4e2d\u4f7f\u7528\uff0c\u64cd\u4f5c\u524d\u8bf7\u9605\u8bfb\u5e2e\u52a9\u548c\u5f53\u524d\u65e5\u5fd7\u3002", x + 64, y + 500, w - 128, 22, 11, FontStyleRegular, C(darkMode, 91, 70, 20, 232, 211, 162));
 
+	// 「检查更新」旁边再放一个次要动作。反馈是低频操作，用 Ghost 描边，
+	// 不和那个实心按钮抢注意力。
+	aboutFeedbackRect = { static_cast<LONG>(x + 366), static_cast<LONG>(y + 153),
+		static_cast<LONG>(x + 516), static_cast<LONG>(y + 193) };
+	PaintButton(g, RectF(x + 366, y + 153, 150, 40), L"意见反馈", kAboutFeedback, ButtonStyle::Ghost, 20, 3);
 	aboutExitRect = { static_cast<LONG>(x + w - 184), static_cast<LONG>(y + h - 56), static_cast<LONG>(x + w - 42), static_cast<LONG>(y + h - 14) };
 	PaintButton(g, RectF(x + w - 184, y + h - 56, 142, 42), L"\u9000\u51fa\u8f6f\u4ef6", 73, ButtonStyle::Danger, 21, 5);
 }
@@ -6782,6 +7149,1153 @@ void MainWindow::PaintUpdateDialog(Graphics& g, int width, int height)
 				fade(primary), 2.0f);
 		}
 	}
+}
+
+// 「防护状态」快捷卡点开的信息面板。概览页那张卡只放得下一个结论，
+// 用户想知道这个结论是怎么来的时没地方可点 —— 这里把运行时快照摊开。
+// 全部只读，没有开关：要改设置去「防护策略」页，这里不抢那份活。
+void MainWindow::PaintProtectDialog(Graphics& g, int width, int height)
+{
+	if (!protectDialogVisible) return;
+	const bool d = darkMode;
+	const float appear = (std::max)(0.0f, (std::min)(1.0f, protectDialogAppear));
+	auto fade = [appear](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * appear), color.GetR(), color.GetG(), color.GetB());
+	};
+	const Color onSurface = C(d, 26, 30, 28, 232, 238, 235);
+	const Color onSurfaceVariant = C(d, 96, 104, 100, 168, 179, 174);
+	const Color outline = C(d, 130, 139, 134, 138, 149, 144);
+	const Color primary = C(d, 0, 107, 95, 130, 213, 199);
+	const Color container = C(d, 243, 247, 245, 38, 45, 42);
+
+	// 和更新弹窗同一层 scrim，底下那页按住不动。
+	{
+		SolidBrush veil(Color(static_cast<BYTE>((d ? 115.0f : 82.0f) * appear), 0, 0, 0));
+		g.FillRectangle(&veil, 0, 0, width, height);
+	}
+
+	const float rowHeight = 34.0f;
+	const float tableTop = 100.0f;
+	const float cardW = (std::max)(420.0f, (std::min)(560.0f, static_cast<float>(width) - 96.0f));
+	const float rowsHeight = rowHeight * static_cast<float>(protectRows.size());
+	const float cardH = tableTop + rowsHeight + 16.0f + 40.0f + 24.0f;
+	const float cardX = (static_cast<float>(width) - cardW) / 2.0f;
+	const float cardY = (static_cast<float>(height) - cardH) / 2.0f + (1.0f - appear) * 10.0f;
+
+	SoftShadow(g, RectF(cardX, cardY, cardW, cardH), 28.0f, d, 1.6f * appear);
+	FillRound(g, RectF(cardX, cardY, cardW, cardH), 28.0f, fade(container));
+
+	DrawIcon(g, 1, cardX + 24.0f, cardY + 26.0f, fade(primary), 24);
+	Text(g, protectHeadline.c_str(), cardX + 58.0f, cardY + 24.0f, cardW - 82.0f, 26.0f, 20,
+		FontStyleBold, fade(onSurface));
+	TextSingleLine(g, protectSummary.c_str(), cardX + 24.0f, cardY + 56.0f, cardW - 48.0f, 18.0f, 12,
+		FontStyleRegular, fade(onSurfaceVariant));
+	{
+		Pen pen(fade(outline), 1.0f);
+		g.DrawLine(&pen, cardX + 24.0f, cardY + 88.0f, cardX + cardW - 24.0f, cardY + 88.0f);
+	}
+
+	// 左标签右值。值里可能带服务名或产品名，用单行省略号收尾，别折行顶到下一行。
+	const float labelWidth = 104.0f;
+	const float valueX = cardX + 24.0f + labelWidth + 12.0f;
+	const float valueW = cardW - 48.0f - labelWidth - 12.0f;
+	for (size_t i = 0; i < protectRows.size(); ++i) {
+		const float rowY = cardY + tableTop + rowHeight * static_cast<float>(i);
+		TextSingleLine(g, protectRows[i].label.c_str(), cardX + 24.0f, rowY + 8.0f, labelWidth, 18.0f,
+			11, FontStyleRegular, fade(onSurfaceVariant));
+		TextSingleLine(g, protectRows[i].value.c_str(), valueX, rowY + 7.0f, valueW, 20.0f,
+			12, FontStyleBold, fade(onSurface));
+	}
+
+	const float buttonW = 88.0f;
+	const float buttonH = 40.0f;
+	const RectF closeRect(cardX + cardW - 24.0f - buttonW, cardY + cardH - 24.0f - buttonH,
+		buttonW, buttonH);
+	PaintButton(g, closeRect, L"\u5173\u95ed", kProtectDialogClose, ButtonStyle::Ghost, 20.0f);
+	protectDialogCloseRect = { static_cast<LONG>(closeRect.X), static_cast<LONG>(closeRect.Y),
+		static_cast<LONG>(closeRect.X + closeRect.Width), static_cast<LONG>(closeRect.Y + closeRect.Height) };
+
+	if (focusTarget == kProtectDialogClose) {
+		StrokeRound(g, RectF(closeRect.X - 3.0f, closeRect.Y - 3.0f, closeRect.Width + 6.0f,
+			closeRect.Height + 6.0f), 23.0f, fade(primary), 2.0f);
+	}
+}
+
+void MainWindow::OpenProtectDialog()
+{
+	// 先问驱动状态：它要碰 SCM，别把它关在状态锁里。
+	// 这里用 CurrentDriverStatus() 而不是 XDriverLoaded() —— 后者只看本进程有没有
+	// 设备句柄，驱动被别的实例加载时会误报成没装。
+	const DriverStatusInfo& driver = CurrentDriverStatus();
+	std::wstring driverText;
+	if (driver.handleOpen) {
+		driverText = driver.serviceName.empty() ? L"\u5df2\u52a0\u8f7d"
+			: (L"\u5df2\u52a0\u8f7d \u00b7 " + driver.serviceName);
+	}
+	else if (driver.serviceRunning) {
+		driverText = driver.serviceName.empty() ? L"\u670d\u52a1\u5728\u8fd0\u884c\uff0c\u672c\u8fdb\u7a0b\u672a\u8fde\u63a5"
+			: (L"\u670d\u52a1 " + driver.serviceName + L" \u5728\u8fd0\u884c\uff0c\u672c\u8fdb\u7a0b\u672a\u8fde\u63a5");
+	}
+	else if (driver.serviceExists) {
+		driverText = driver.serviceName.empty() ? L"\u670d\u52a1\u5df2\u5b89\u88c5\uff0c\u672a\u8fd0\u884c"
+			: (L"\u670d\u52a1 " + driver.serviceName + L" \u5df2\u5b89\u88c5\uff0c\u672a\u8fd0\u884c");
+	}
+	else {
+		driverText = L"\u672a\u5b89\u88c5";
+	}
+
+	// 快照这段要在状态锁里读，和 PaintOverview 一个口径。抓完立刻放锁：
+	// 下面 SetForegroundWindow / SetFocus 会同步回调窗口过程，那些路径也走
+	// stateMutex，持着锁进去就是自己等自己。
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		protectRows.clear();
+		auto addRow = [this](const wchar_t* label, const std::wstring& value) {
+			if (value.empty()) return;
+			ProtectInfoRow row;
+			row.label = label;
+			row.value = value;
+			protectRows.push_back(std::move(row));
+		};
+
+		std::wstring hostText;
+		if (studentRunning) {
+			wchar_t buffer[64] = {};
+			swprintf_s(buffer, L"StudentMain.exe \u00b7 PID %lu", static_cast<unsigned long>(studentPid));
+			hostText = buffer;
+		}
+		else if (eduHostCount > 0) {
+			hostText = L"\u5176\u4ed6\u6559\u5ba4 " + std::to_wstring(eduHostCount) + L" \u4e2a";
+		}
+		else if (!eduHostSummary.empty()) {
+			hostText = L"\u5f85\u63a5\u7ba1\uff08\u8fdb\u7a0b\u5728\u8fd0\u884c\uff09";
+		}
+		else {
+			hostText = L"\u672a\u8fd0\u884c";
+		}
+
+		// 五个阻止类开关里开了几个。这里不做成一行一项：它只回答
+		// 我上次关掉的那个是不是还关着，逐项明细在「防护策略」页。
+		int blocked = 0;
+		if (setProhibitKillProcess) ++blocked;
+		if (setProhibitCloseWindow) ++blocked;
+		if (setBandAllRunOp) ++blocked;
+		if (setBlockWindowOps) ++blocked;
+		if (setBlockDriverAccess) ++blocked;
+		wchar_t blockText[32] = {};
+		swprintf_s(blockText, L"%d / 5 \u9879", blocked);
+
+		std::wstring version = DisplayVersion(ReadOwnFileVersion());
+		addRow(L"\u603b\u4f53\u72b6\u6001", currentControlled ? L"\u5b8c\u6574\u9632\u62a4" : L"\u6b63\u5728\u76d1\u63a7");
+		addRow(L"\u53d7\u63a7\u5bbf\u4e3b", hostText);
+		if (!eduHostSummary.empty()) addRow(L"\u5df2\u63a5\u7ba1\u6559\u5ba4", eduHostSummary);
+		addRow(L"\u4e3b\u9a71\u52a8", driverText);
+		addRow(L"\u81ea\u6211\u4fdd\u62a4", advSelfProtect ? L"\u5df2\u5f00\u542f" : L"\u5df2\u5173\u95ed");
+		addRow(L"\u62e6\u622a\u7b56\u7565", blockText);
+		addRow(L"\u7248\u672c", version.empty() ? L"\u672a\u77e5" : version);
+		addRow(L"\u6784\u5efa\u65f6\u95f4", JTBuildDateWide());
+
+		protectSummary = currentControlled
+			? L"\u94a9\u5b50\u4e0e\u5185\u6838\u4fdd\u62a4\u90fd\u5728\u5de5\u4f5c\uff0c\u7ed3\u675f\u8fdb\u7a0b\u3001\u5173\u673a\u548c\u6293\u5c4f\u8bf7\u6c42\u4f1a\u88ab\u62e6\u4e0b"
+			: L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\uff0c\u90e8\u5206\u80fd\u529b\u8981\u7b49\u4e3b\u9a71\u52a8\u52a0\u8f7d\u540e\u624d\u751f\u6548";
+	}
+
+	protectHeadline = L"\u9632\u62a4\u72b6\u6001";
+	protectDialogVisible = true;
+	protectDialogAppear = 0.0f;
+	protectDialogCloseRect = {};
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	SetForegroundWindow(_hWnd);
+	SetFocus(_hWnd);
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::CloseProtectDialog()
+{
+	protectDialogVisible = false;
+	protectDialogAppear = 0.0f;
+	protectDialogCloseRect = {};
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	ApplyDialogOcclusion();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+int MainWindow::HitProtectDialogAt(POINT point) const
+{
+	if (!protectDialogVisible) return -1;
+	if (!IsRectEmpty(&protectDialogCloseRect) && Hit(protectDialogCloseRect, point))
+		return kProtectDialogClose;
+	return -1;
+}
+
+bool MainWindow::HandleProtectDialogClick(POINT point)
+{
+	if (!protectDialogVisible) return false;
+	// 卡片外点一下也关：这面板没有别的操作，留在屏幕上只会挡住概览。
+	// 所以命中的是关闭按钮还是空白，结果一样。
+	CloseProtectDialog();
+	(void)point;
+	return true;
+}
+
+// ---------------------------------------------------------------- feedback
+//
+// 「意见反馈」：自绘卡片 + 三个原生 EDIT。输入必须是真控件 —— 中文输入法的
+// 组合串、光标、选区、右键菜单、剪贴板只有真控件才走系统那套（进程选择器当年
+// 就是自绘输入框，在中文输入法下等于死的，见 EnsureProcessPickerSearchEdit）。
+//
+// 打包和上传都放在后台线程：日志可能几 MB，压缩几百毫秒，上传还得看网络。
+// 这一整套压在主线程上，窗口会直接白掉。
+
+namespace
+{
+	// 一个待打包的文件：source 是磁盘上的实际路径，zipName 是包内名字。
+	// zipName 保持纯 ASCII —— 包里没必要出现中文，出问题时要靠肉眼读、
+	// 靠脚本查，名字越简单越好。
+	struct FeedbackBundleEntry {
+		std::wstring source;
+		std::wstring zipName;
+	};
+
+	// 一次提交作业。UI 线程填好字段，工作线程只读；结果在最后用 mutex 交接。
+	struct FeedbackJob {
+		HWND window = nullptr;
+		std::wstring tempDir;
+		std::wstring bundlePath;
+		std::wstring metaJson;
+		std::wstring systemText;
+		std::wstring feedbackText;
+		std::vector<FeedbackBundleEntry> entries;
+		std::mutex mutex;
+		bool ok = false;
+		std::wstring message;
+	};
+
+	std::shared_ptr<FeedbackJob> g_feedbackJob;
+
+	struct FeedbackGeometry {
+		RectF card;
+		RectF descLabel;
+		RectF descBox;
+		RectF reproLabel;
+		RectF reproBox;
+		RectF contactLabel;
+		RectF contactBox;
+	};
+
+	// 卡片几何两处共用：PaintFeedbackDialog 画框，PositionFeedbackEdits 把
+	// EDIT 摆进框里。分开算的话改一个数字就要同步两处，迟早错位。
+	FeedbackGeometry ComputeFeedbackGeometry(int width, int height)
+	{
+		FeedbackGeometry geo;
+		float cardW = 600.0f;
+		if (static_cast<float>(width) - 96.0f < cardW) cardW = static_cast<float>(width) - 96.0f;
+		if (cardW < 420.0f) cardW = 420.0f;
+		const float cardH = 588.0f;
+		geo.card = RectF((static_cast<float>(width) - cardW) / 2.0f,
+			(static_cast<float>(height) - cardH) / 2.0f, cardW, cardH);
+		const float x = geo.card.X + 24.0f;
+		const float y = geo.card.Y;
+		const float w = cardW - 48.0f;
+		geo.descLabel = RectF(x, y + 116.0f, w, 18.0f);
+		geo.descBox = RectF(x, y + 138.0f, w, 92.0f);
+		geo.reproLabel = RectF(x, y + 240.0f, w, 18.0f);
+		geo.reproBox = RectF(x, y + 262.0f, w, 104.0f);
+		geo.contactLabel = RectF(x, y + 376.0f, w, 18.0f);
+		geo.contactBox = RectF(x, y + 398.0f, w, 36.0f);
+		return geo;
+	}
+
+	RECT ToRect(const RectF& rect)
+	{
+		RECT out{};
+		out.left = static_cast<LONG>(rect.X);
+		out.top = static_cast<LONG>(rect.Y);
+		out.right = static_cast<LONG>(rect.X + rect.Width);
+		out.bottom = static_cast<LONG>(rect.Y + rect.Height);
+		return out;
+	}
+
+	std::wstring JsonEscape(const std::wstring& text)
+	{
+		std::wstring out;
+		out.reserve(text.size() + 32);
+		for (wchar_t ch : text) {
+			switch (ch) {
+			case L'"': out += L"\\\""; break;
+			case L'\\': out += L"\\\\"; break;
+			case L'\n': out += L"\\n"; break;
+			case L'\r': out += L"\\r"; break;
+			case L'\t': out += L"\\t"; break;
+			default:
+				if (ch < 0x20 || ch == 0x7F) {
+					wchar_t buffer[8] = {};
+					swprintf_s(buffer, L"\\u%04X", static_cast<unsigned>(ch));
+					out += buffer;
+				}
+				else {
+					out.push_back(ch);
+				}
+				break;
+			}
+		}
+		return out;
+	}
+
+	std::wstring ReadControlText(HWND edit)
+	{
+		if (!edit) return std::wstring();
+		const int length = GetWindowTextLengthW(edit);
+		if (length <= 0) return std::wstring();
+		std::vector<wchar_t> buffer(static_cast<size_t>(length) + 1, L'\0');
+		GetWindowTextW(edit, buffer.data(), length + 1);
+		return std::wstring(buffer.data(), static_cast<size_t>(length));
+	}
+
+	// 去掉首尾空白，统一换行成 \n，再按上限截断。后面要塞进 JSON，
+	// 两套换行混着只会让服务端多一层判断。
+	std::wstring NormalizeMultiline(const std::wstring& text, size_t limit)
+	{
+		std::wstring out;
+		out.reserve(text.size());
+		for (wchar_t ch : text) {
+			if (ch == L'\r') continue;
+			out.push_back(ch);
+		}
+		const size_t begin = out.find_first_not_of(L" \t\n");
+		if (begin == std::wstring::npos) return std::wstring();
+		const size_t end = out.find_last_not_of(L" \t\n");
+		out = out.substr(begin, end - begin + 1);
+		if (out.size() > limit) {
+			out.resize(limit);
+			out += L"…";
+		}
+		return out;
+	}
+
+	bool WriteUtf8File(const std::wstring& path, const std::wstring& text)
+	{
+		std::string bytes;
+		if (!text.empty()) {
+			const int count = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+				static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+			if (count <= 0) return false;
+			bytes.resize(static_cast<size_t>(count));
+			WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+				&bytes[0], count, nullptr, nullptr);
+		}
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		const bool ok = bytes.empty() ||
+			(WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr) &&
+				written == bytes.size());
+		CloseHandle(file);
+		return ok;
+	}
+
+	// 日志超过 limit 时只取尾部。崩溃、注入失败这些要查的东西都在最后几屏，
+	// 前面是几小时的正常运行记录；整包带上去只是给服务器添个几十 MB 的包袱。
+	bool AddLogEntry(std::vector<FeedbackBundleEntry>& entries, const std::wstring& source,
+		const std::wstring& zipName, const std::wstring& tempDir, unsigned long long limit,
+		unsigned int serial)
+	{
+		WIN32_FILE_ATTRIBUTE_DATA info{};
+		if (!GetFileAttributesExW(source.c_str(), GetFileExInfoStandard, &info)) return false;
+		const unsigned long long size = (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) |
+			info.nFileSizeLow;
+		if (size <= limit) {
+			entries.push_back({ source, zipName });
+			return true;
+		}
+
+		HANDLE file = CreateFileW(source.c_str(), GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		LARGE_INTEGER offset{};
+		offset.QuadPart = static_cast<LONGLONG>(size - limit);
+		std::string tail;
+		if (SetFilePointerEx(file, offset, nullptr, FILE_BEGIN)) {
+			tail.resize(static_cast<size_t>(limit));
+			DWORD read = 0;
+			if (ReadFile(file, &tail[0], static_cast<DWORD>(tail.size()), &read, nullptr))
+				tail.resize(read);
+			else
+				tail.clear();
+		}
+		CloseHandle(file);
+		if (tail.empty()) return false;
+
+		wchar_t name[64] = {};
+		swprintf_s(name, L"tail-%u.log", serial);
+		const std::wstring tempPath = tempDir + L"\\" + name;
+		HANDLE out = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (out == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		const bool ok = WriteFile(out, tail.data(), static_cast<DWORD>(tail.size()), &written,
+			nullptr) && written == tail.size();
+		CloseHandle(out);
+		if (!ok) return false;
+		entries.push_back({ tempPath, zipName });
+		return true;
+	}
+
+	// 自己写一个 store-only 的 zip。仓库里的 XZip 没编进工程，而它那套
+	// info-zip 派生的代码只为「加几个文件」引进来不划算；这边只用到四种结构：
+	// 本地文件头、中央目录项、目录结束记录，外加一个 CRC-32。
+	//
+	// 不压缩是权衡后的选择：当天日志限到 1.5 MB，压不压都在 2 MB 上下，
+	// 换来的是不引依赖、包内名字完全可控（纯 ASCII，不会在别的工具里乱码）。
+	void AppendLe16(std::string& out, unsigned value)
+	{
+		out.push_back(static_cast<char>(value & 0xFF));
+		out.push_back(static_cast<char>((value >> 8) & 0xFF));
+	}
+
+	void AppendLe32(std::string& out, unsigned value)
+	{
+		AppendLe16(out, value & 0xFFFF);
+		AppendLe16(out, (value >> 16) & 0xFFFF);
+	}
+
+	unsigned Crc32(const unsigned char* data, size_t size)
+	{
+		static unsigned table[256] = {};
+		static bool ready = false;
+		// 只在反馈打包线程里调用，静态初始化不存在并发问题。
+		if (!ready) {
+			for (unsigned i = 0; i < 256; ++i) {
+				unsigned value = i;
+				for (int bit = 0; bit < 8; ++bit)
+					value = (value & 1) ? (0xEDB88320u ^ (value >> 1)) : (value >> 1);
+				table[i] = value;
+			}
+			ready = true;
+		}
+		unsigned crc = 0xFFFFFFFFu;
+		for (size_t i = 0; i < size; ++i)
+			crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+		return crc ^ 0xFFFFFFFFu;
+	}
+
+	std::string Utf8Of(const std::wstring& text)
+	{
+		if (text.empty()) return std::string();
+		const int count = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+			static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+		if (count <= 0) return std::string();
+		std::string out(static_cast<size_t>(count), '\0');
+		WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()),
+			&out[0], count, nullptr, nullptr);
+		return out;
+	}
+
+	bool ReadFileBytes(const std::wstring& path, size_t limit, std::string& out)
+	{
+		out.clear();
+		HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		LARGE_INTEGER size{};
+		if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+			static_cast<unsigned long long>(size.QuadPart) > limit) {
+			CloseHandle(file);
+			return false;
+		}
+		out.resize(static_cast<size_t>(size.QuadPart));
+		DWORD read = 0;
+		const bool ok = ReadFile(file, &out[0], static_cast<DWORD>(out.size()), &read, nullptr) &&
+			read == out.size();
+		CloseHandle(file);
+		if (!ok) out.clear();
+		return ok;
+	}
+
+	bool WriteStoredZip(const std::wstring& zipPath,
+		const std::vector<FeedbackBundleEntry>& entries)
+	{
+		HANDLE out = CreateFileW(zipPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+			FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (out == INVALID_HANDLE_VALUE) return false;
+
+		SYSTEMTIME now{};
+		GetLocalTime(&now);
+		const unsigned dosTime = (now.wHour << 11) | (now.wMinute << 5) | (now.wSecond / 2);
+		const unsigned dosDate = ((now.wYear - 1980) << 9) | (now.wMonth << 5) | now.wDay;
+
+		unsigned offset = 0;
+		auto write = [out](const void* data, size_t size) {
+			DWORD written = 0;
+			return WriteFile(out, data, static_cast<DWORD>(size), &written, nullptr) != FALSE &&
+				written == size;
+		};
+
+		struct CentralEntry {
+			std::string name;
+			unsigned crc = 0;
+			unsigned size = 0;
+			unsigned offset = 0;
+		};
+		std::vector<CentralEntry> central;
+		bool ok = true;
+		for (const FeedbackBundleEntry& entry : entries) {
+			std::string bytes;
+			if (!ReadFileBytes(entry.source, 4u << 20, bytes)) continue;
+			const std::string name = Utf8Of(entry.zipName);
+			if (name.empty() || name.size() > 200) continue;
+			const unsigned crc = Crc32(reinterpret_cast<const unsigned char*>(bytes.data()),
+				bytes.size());
+
+			std::string head;
+			AppendLe32(head, 0x04034B50u);
+			AppendLe16(head, 20);              // version needed
+			AppendLe16(head, 0x0800);          // flags：名字是 UTF-8
+			AppendLe16(head, 0);               // method：store
+			AppendLe16(head, dosTime);
+			AppendLe16(head, dosDate);
+			AppendLe32(head, crc);
+			AppendLe32(head, static_cast<unsigned>(bytes.size()));
+			AppendLe32(head, static_cast<unsigned>(bytes.size()));
+			AppendLe16(head, static_cast<unsigned>(name.size()));
+			AppendLe16(head, 0);
+			ok = write(head.data(), head.size()) && write(name.data(), name.size()) &&
+				write(bytes.data(), bytes.size());
+			if (!ok) break;
+			central.push_back({ name, crc, static_cast<unsigned>(bytes.size()), offset });
+			offset += static_cast<unsigned>(head.size() + name.size() + bytes.size());
+		}
+
+		const unsigned centralStart = offset;
+		for (const CentralEntry& entry : central) {
+			if (!ok) break;
+			std::string head;
+			AppendLe32(head, 0x02014B50u);
+			AppendLe16(head, 20);              // version made by
+			AppendLe16(head, 20);              // version needed
+			AppendLe16(head, 0x0800);
+			AppendLe16(head, 0);
+			AppendLe16(head, dosTime);
+			AppendLe16(head, dosDate);
+			AppendLe32(head, entry.crc);
+			AppendLe32(head, entry.size);
+			AppendLe32(head, entry.size);
+			AppendLe16(head, static_cast<unsigned>(entry.name.size()));
+			AppendLe16(head, 0);
+			AppendLe16(head, 0);
+			AppendLe16(head, 0);
+			AppendLe16(head, 0);
+			AppendLe32(head, 0);
+			AppendLe32(head, entry.offset);
+			ok = write(head.data(), head.size()) && write(entry.name.data(), entry.name.size());
+			offset += static_cast<unsigned>(head.size() + entry.name.size());
+		}
+
+		if (ok) {
+			std::string end;
+			AppendLe32(end, 0x06054B50u);
+			AppendLe16(end, 0);
+			AppendLe16(end, 0);
+			AppendLe16(end, static_cast<unsigned>(central.size()));
+			AppendLe16(end, static_cast<unsigned>(central.size()));
+			AppendLe32(end, offset - centralStart);
+			AppendLe32(end, centralStart);
+			AppendLe16(end, 0);
+			ok = write(end.data(), end.size());
+		}
+		CloseHandle(out);
+		if (!ok || central.empty()) {
+			DeleteFileW(zipPath.c_str());
+			return false;
+		}
+		return true;
+	}
+
+	DWORD WINAPI FeedbackUploadThreadProc(LPVOID parameter)
+	{
+		std::unique_ptr<std::shared_ptr<FeedbackJob>> holder(
+			static_cast<std::shared_ptr<FeedbackJob>*>(parameter));
+		const std::shared_ptr<FeedbackJob> job = holder ? *holder : nullptr;
+		if (!job) return 1;
+
+		CreateDirectoryW(job->tempDir.c_str(), nullptr);
+		bool ok = false;
+		std::wstring message;
+
+		const std::wstring systemPath = job->tempDir + L"\\system.txt";
+		const std::wstring feedbackPath = job->tempDir + L"\\feedback.txt";
+		if (!WriteUtf8File(systemPath, job->systemText)) {
+			message = L"无法写入系统信息";
+		}
+		else if (!WriteUtf8File(feedbackPath, job->feedbackText)) {
+			message = L"无法写入反馈内容";
+		}
+		else {
+			std::vector<FeedbackBundleEntry> entries = job->entries;
+			entries.insert(entries.begin(), { feedbackPath, L"feedback.txt" });
+			entries.insert(entries.begin(), { systemPath, L"system.txt" });
+			if (!WriteStoredZip(job->bundlePath, entries)) {
+				message = L"无法生成反馈包";
+			}
+			else {
+				wchar_t error[512] = {};
+				ok = JUpdater_SubmitFeedback(job->bundlePath.c_str(), job->metaJson.c_str(),
+					error, _countof(error), 120000) != FALSE;
+				if (!ok) message = error[0] ? error : L"上传失败";
+			}
+		}
+
+		DeleteFileW(job->bundlePath.c_str());
+		DeleteFileW(systemPath.c_str());
+		DeleteFileW(feedbackPath.c_str());
+		for (const FeedbackBundleEntry& entry : job->entries) {
+			// 只有截断出来的临时文件在 tempDir 里，原始日志一个字节都不能动。
+			if (entry.source.compare(0, job->tempDir.size(), job->tempDir) == 0)
+				DeleteFileW(entry.source.c_str());
+		}
+		RemoveDirectoryW(job->tempDir.c_str());
+
+		{
+			std::lock_guard<std::mutex> guard(job->mutex);
+			job->ok = ok;
+			job->message = ok ? L"反馈已提交" : (message.empty() ? L"提交失败" : message);
+		}
+		if (job->window) PostMessageW(job->window, WM_MY_FEEDBACK_DONE, 0, 0);
+		return ok ? 0 : 1;
+	}
+
+	std::wstring QueryCpuName()
+	{
+		HKEY key = nullptr;
+		if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+			L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0, KEY_QUERY_VALUE,
+			&key) != ERROR_SUCCESS) {
+			return std::wstring();
+		}
+		wchar_t buffer[256] = {};
+		DWORD size = sizeof(buffer);
+		DWORD type = 0;
+		const LONG status = RegQueryValueExW(key, L"ProcessorNameString", nullptr, &type,
+			reinterpret_cast<LPBYTE>(buffer), &size);
+		RegCloseKey(key);
+		if (status != ERROR_SUCCESS || type != REG_SZ) return std::wstring();
+		std::wstring name(buffer);
+		while (!name.empty() && name.back() == L' ') name.pop_back();
+		return name;
+	}
+}
+
+void MainWindow::PaintFeedbackDialog(Graphics& g, int width, int height)
+{
+	if (!feedbackDialogVisible) return;
+	const bool d = darkMode;
+	const float appear = (std::max)(0.0f, (std::min)(1.0f, feedbackDialogAppear));
+	auto fade = [appear](const Color& color) {
+		return Color(static_cast<BYTE>(color.GetA() * appear), color.GetR(), color.GetG(), color.GetB());
+	};
+	const Color onSurface = C(d, 26, 30, 28, 232, 238, 235);
+	const Color onSurfaceVariant = C(d, 96, 104, 100, 168, 179, 174);
+	const Color outline = C(d, 130, 139, 134, 138, 149, 144);
+	const Color primary = C(d, 0, 107, 95, 130, 213, 199);
+	const Color container = C(d, 243, 247, 245, 38, 45, 42);
+	const Color errorColor = C(d, 155, 45, 36, 244, 178, 165);
+
+	{
+		SolidBrush veil(Color(static_cast<BYTE>((d ? 115.0f : 82.0f) * appear), 0, 0, 0));
+		g.FillRectangle(&veil, 0, 0, width, height);
+	}
+
+	const FeedbackGeometry geo = ComputeFeedbackGeometry(width, height);
+	const float cardX = geo.card.X;
+	const float cardY = geo.card.Y;
+	const float cardW = geo.card.Width;
+	const float cardH = geo.card.Height;
+
+	SoftShadow(g, geo.card, 28.0f, d, 1.6f * appear);
+	FillRound(g, geo.card, 28.0f, fade(container));
+
+	DrawIcon(g, 2, cardX + 24.0f, cardY + 26.0f, fade(primary), 24);
+	Text(g, L"意见反馈", cardX + 58.0f, cardY + 24.0f, cardW - 82.0f, 28.0f, 20, FontStyleBold,
+		fade(onSurface));
+	TextSingleLine(g, L"写清问题和复现步骤，当天的日志与系统信息会一并附上",
+		cardX + 24.0f, cardY + 58.0f, cardW - 48.0f, 18.0f, 12, FontStyleRegular,
+		fade(onSurfaceVariant));
+	{
+		Pen pen(fade(outline), 1.0f);
+		g.DrawLine(&pen, cardX + 24.0f, cardY + 90.0f, cardX + cardW - 24.0f, cardY + 90.0f);
+	}
+
+	auto label = [&](const RectF& rect, const wchar_t* text, bool required) {
+		TextSingleLine(g, text, rect.X, rect.Y, rect.Width - 56.0f, rect.Height, 11,
+			FontStyleBold, fade(onSurfaceVariant));
+		if (required) {
+			TextSingleLine(g, L"必填", rect.X + rect.Width - 52.0f, rect.Y, 52.0f, rect.Height, 10,
+				FontStyleRegular, fade(primary));
+		}
+	};
+	label(geo.descLabel, L"问题描述", true);
+	label(geo.reproLabel, L"复现步骤", true);
+	label(geo.contactLabel, L"联系方式（可选）", false);
+
+	// 输入框：EDIT 盖在中间，这里只画圆角底和一圈描边。填充色必须和
+	// feedbackFieldBrush 完全一致，否则圆角里会露出一个色差方块。
+	auto field = [&](const RectF& box, bool focused) {
+		FillRound(g, box, 12.0f, fade(C(d, 243, 247, 245, 38, 45, 42)));
+		StrokeRound(g, box, 12.0f, focused ? fade(primary) : fade(outline), focused ? 1.6f : 1.0f);
+	};
+	field(geo.descBox, GetFocus() == feedbackDescEdit);
+	field(geo.reproBox, GetFocus() == feedbackReproEdit);
+	field(geo.contactBox, GetFocus() == feedbackContactEdit);
+
+	// 写清"会上传什么"，比一句"我们重视你的隐私"有用。
+	TextSingleLine(g, L"附带内容：当天运行日志、系统版本与硬件信息、当前防护状态。不含个人文件。",
+		cardX + 24.0f, cardY + 446.0f, cardW - 48.0f, 18.0f, 10, FontStyleRegular,
+		fade(onSurfaceVariant));
+
+	if (!feedbackStatus.empty()) {
+		Text(g, feedbackStatus.c_str(), cardX + 24.0f, cardY + 470.0f, cardW - 48.0f, 38.0f, 11,
+			feedbackSubmitFailed ? FontStyleBold : FontStyleRegular,
+			feedbackSubmitFailed ? fade(errorColor) : fade(onSurfaceVariant));
+	}
+
+	const float buttonY = cardY + cardH - 24.0f - 40.0f;
+	const float submitW = 120.0f;
+	const float cancelW = 88.0f;
+	const float gap = 10.0f;
+	const float submitX = cardX + cardW - 24.0f - submitW;
+	const float cancelX = submitX - gap - cancelW;
+	feedbackSubmitRect = ToRect(RectF(submitX, buttonY, submitW, 40.0f));
+	feedbackCancelRect = ToRect(RectF(cancelX, buttonY, cancelW, 40.0f));
+	PaintButton(g, RectF(submitX, buttonY, submitW, 40.0f),
+		feedbackSubmitting ? L"提交中…" : L"提交反馈", kFeedbackSubmit,
+		ButtonStyle::Primary, 20.0f, -1, !feedbackSubmitting);
+	PaintButton(g, RectF(cancelX, buttonY, cancelW, 40.0f), L"取消", kFeedbackCancel,
+		ButtonStyle::Ghost, 20.0f, -1, !feedbackSubmitting);
+
+	// 弹窗期间通用的焦点环被 ModalDialogVisible() 关掉了，这里自己画一圈。
+	if (focusTarget == kFeedbackSubmit || focusTarget == kFeedbackCancel) {
+		const RECT& source = focusTarget == kFeedbackSubmit ? feedbackSubmitRect : feedbackCancelRect;
+		if (!IsRectEmpty(&source)) {
+			StrokeRound(g, RectF(static_cast<REAL>(source.left) - 3.0f, static_cast<REAL>(source.top) - 3.0f,
+				static_cast<REAL>(source.right - source.left) + 6.0f,
+				static_cast<REAL>(source.bottom - source.top) + 6.0f), 23.0f,
+				fade(primary), 2.0f);
+		}
+	}
+}
+
+void MainWindow::OpenFeedbackDialog()
+{
+	feedbackDialogVisible = true;
+	feedbackDialogAppear = 0.0f;
+	feedbackSubmitting = false;
+	feedbackSubmitFailed = false;
+	feedbackStatus.clear();
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+
+	EnsureFeedbackEdits();
+	if (feedbackDescEdit) SetWindowTextW(feedbackDescEdit, L"");
+	if (feedbackReproEdit) SetWindowTextW(feedbackReproEdit, L"");
+	if (feedbackContactEdit) SetWindowTextW(feedbackContactEdit, L"");
+
+	ApplyDialogOcclusion();
+	SetForegroundWindow(_hWnd);
+	SetFocus(_hWnd);
+	PositionFeedbackEdits();
+	if (feedbackDescEdit) SetFocus(feedbackDescEdit);
+	EnsureAnimationTimer();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+void MainWindow::CloseFeedbackDialog()
+{
+	// 上传中途不给关：关了也看不到结果，而那一轮请求还在服务器那边跑。
+	if (feedbackSubmitting) return;
+	feedbackDialogVisible = false;
+	feedbackStatus.clear();
+	feedbackSubmitFailed = false;
+	for (HWND edit : { feedbackDescEdit, feedbackReproEdit, feedbackContactEdit }) {
+		if (edit) ShowWindow(edit, SW_HIDE);
+	}
+	if (GetFocus() == feedbackDescEdit || GetFocus() == feedbackReproEdit ||
+		GetFocus() == feedbackContactEdit) {
+		SetFocus(_hWnd);
+	}
+	focusTarget = -1;
+	hoverTarget = -1;
+	pressTarget = -1;
+	// 关掉之后这两块矩形要清空：它们只在 Paint 里赋值，留着会让
+	// TargetRect(kFeedbackSubmit) 继续命中一个已经不存在的按钮。
+	feedbackSubmitRect = {};
+	feedbackCancelRect = {};
+	ApplyDialogOcclusion();
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+// 三个 EDIT 建一次就够，之后只挪位置。多行框要 ES_WANTRETURN，否则回车会被
+// 当成"默认按钮"吞掉；滚动条只在内容超出时才有事可做。
+void MainWindow::EnsureFeedbackEdits()
+{
+	auto ensure = [this](HWND& edit, int id, DWORD style) {
+		if (edit) return;
+		edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP | style,
+			0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+			JTAppGetInstanceDirect(), nullptr);
+		if (!edit) return;
+		if (controlFont) SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(controlFont), TRUE);
+	};
+	ensure(feedbackDescEdit, kFeedbackDescEdit,
+		ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL | WS_VSCROLL);
+	ensure(feedbackReproEdit, kFeedbackReproEdit,
+		ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL | WS_VSCROLL);
+	ensure(feedbackContactEdit, kFeedbackContactEdit, ES_AUTOHSCROLL);
+
+	if (feedbackDescEdit) SendMessageW(feedbackDescEdit, EM_SETLIMITTEXT, 1600, 0);
+	if (feedbackReproEdit) SendMessageW(feedbackReproEdit, EM_SETLIMITTEXT, 3200, 0);
+	if (feedbackContactEdit) SendMessageW(feedbackContactEdit, EM_SETLIMITTEXT, 120, 0);
+
+	if (feedbackEditProc) return;
+	for (HWND edit : { feedbackDescEdit, feedbackReproEdit, feedbackContactEdit }) {
+		if (!edit) continue;
+		feedbackEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(edit, GWLP_WNDPROC,
+			reinterpret_cast<LONG_PTR>(FeedbackEditProc)));
+	}
+}
+
+void MainWindow::PositionFeedbackEdits()
+{
+	if (!feedbackDialogVisible) return;
+	RECT client{};
+	GetClientRect(_hWnd, &client);
+	const FeedbackGeometry geo = ComputeFeedbackGeometry(ToLogical(client.right),
+		ToLogical(client.bottom));
+	const bool revealed = feedbackDialogAppear > 0.35f;
+
+	auto place = [&](HWND edit, const RectF& box) {
+		if (!edit) return;
+		// 圆角画在父窗口上，EDIT 是方的：四周各让 10 / 6 像素，贴边会削掉圆角。
+		RECT target{};
+		target.left = ToPhysical(static_cast<int>(box.X) + 10);
+		target.top = ToPhysical(static_cast<int>(box.Y) + 6);
+		target.right = ToPhysical(static_cast<int>(box.X + box.Width) - 10);
+		target.bottom = ToPhysical(static_cast<int>(box.Y + box.Height) - 6);
+		RECT current{};
+		GetWindowRect(edit, &current);
+		MapWindowPoints(HWND_DESKTOP, _hWnd, reinterpret_cast<POINT*>(&current), 2);
+		if (!EqualRect(&current, &target)) {
+			SetWindowPos(edit, HWND_TOP, target.left, target.top, target.right - target.left,
+				target.bottom - target.top, SWP_NOACTIVATE);
+		}
+		// 卡片是淡入的，原生控件没法跟着淡：等底色铺开再露头，免得出现
+		// "白框浮在空地上"的一帧。
+		if (revealed) {
+			if (!IsWindowVisible(edit)) ShowWindow(edit, SW_SHOW);
+		}
+		else if (IsWindowVisible(edit)) {
+			ShowWindow(edit, SW_HIDE);
+		}
+	};
+	place(feedbackDescEdit, geo.descBox);
+	place(feedbackReproEdit, geo.reproBox);
+	place(feedbackContactEdit, geo.contactBox);
+}
+
+void MainWindow::SubmitFeedback()
+{
+	if (feedbackSubmitting) return;
+
+	const std::wstring description = NormalizeMultiline(ReadControlText(feedbackDescEdit), 1500);
+	const std::wstring repro = NormalizeMultiline(ReadControlText(feedbackReproEdit), 3000);
+	const std::wstring contact = NormalizeMultiline(ReadControlText(feedbackContactEdit), 120);
+	if (description.empty()) {
+		feedbackStatus = L"请先写一下遇到了什么问题。";
+		feedbackSubmitFailed = true;
+		if (feedbackDescEdit) SetFocus(feedbackDescEdit);
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	if (repro.empty()) {
+		feedbackStatus = L"请补充复现步骤 —— 在哪一步出的问题，越具体越好。";
+		feedbackSubmitFailed = true;
+		if (feedbackReproEdit) SetFocus(feedbackReproEdit);
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+
+	feedbackSubmitting = true;
+	feedbackSubmitFailed = false;
+	feedbackStatus = L"正在打包日志并上传，请稍候…";
+	InvalidateRect(_hWnd, nullptr, FALSE);
+
+	const std::wstring currentDir = JTAppGetCurrentDirDirect() ? JTAppGetCurrentDirDirect() : L"";
+	const std::wstring logDir = currentDir + L"\\logs";
+	SYSTEMTIME now{};
+	GetLocalTime(&now);
+	wchar_t logName[64] = {};
+	swprintf_s(logName, L"DzjsTrainer-%04d-%02d-%02d.log", now.wYear, now.wMonth, now.wDay);
+
+	auto job = std::make_shared<FeedbackJob>();
+	job->window = _hWnd;
+
+	WCHAR tempRoot[MAX_PATH] = {};
+	if (!GetTempPathW(_countof(tempRoot), tempRoot)) tempRoot[0] = L'\0';
+	wchar_t folder[80] = {};
+	swprintf_s(folder, L"DzjsTrainer-feedback-%lu-%llu",
+		static_cast<unsigned long>(GetCurrentProcessId()),
+		static_cast<unsigned long long>(GetTickCount64()));
+	job->tempDir = (tempRoot[0] ? std::wstring(tempRoot) : std::wstring()) + folder;
+	job->bundlePath = job->tempDir + L"\\bundle.zip";
+
+	// 主日志超过 1.5 MB 只带尾部。全天的正常记录没有排查价值，传上去只是
+	// 让上传更容易卡在超时上。
+	AddLogEntry(job->entries, logDir + L"\\" + logName, std::wstring(L"logs/") + logName,
+		job->tempDir, 1536ull * 1024, 1);
+	// 注入端的调试日志不在 logs 下，和 exe 同目录。
+	AddLogEntry(job->entries, currentDir + L"\\DzjsTrainerHooks-debug.log",
+		L"logs/DzjsTrainerHooks-debug.log", job->tempDir, 384ull * 1024, 2);
+
+	std::wstring fileList;
+	for (const FeedbackBundleEntry& entry : job->entries) {
+		WIN32_FILE_ATTRIBUTE_DATA info{};
+		if (!GetFileAttributesExW(entry.source.c_str(), GetFileExInfoStandard, &info)) continue;
+		const unsigned long long size = (static_cast<unsigned long long>(info.nFileSizeHigh) << 32) |
+			info.nFileSizeLow;
+		if (!fileList.empty()) fileList += L", ";
+		fileList += entry.zipName + L" (" + std::to_wstring((size + 1023) / 1024) + L" KB)";
+	}
+
+	wchar_t stamp[64] = {};
+	swprintf_s(stamp, L"%04d-%02d-%02d %02d:%02d:%02d", now.wYear, now.wMonth, now.wDay,
+		now.wHour, now.wMinute, now.wSecond);
+
+	job->systemText = BuildFeedbackSystemInfo();
+	job->feedbackText = L"Dzjs Trainer 用户反馈\r\n提交时间：" + std::wstring(stamp) +
+		L"\r\n\r\n【问题描述】\r\n" + description +
+		L"\r\n\r\n【复现步骤】\r\n" + repro +
+		(contact.empty() ? L"" : L"\r\n\r\n【联系方式】\r\n" + contact) + L"\r\n";
+
+	auto jsonField = [](const wchar_t* name, const std::wstring& value, bool comma) {
+		std::wstring out = L"  \"";
+		out += name;
+		out += L"\": \"";
+		out += JsonEscape(value);
+		out += L"\"";
+		out += comma ? L",\r\n" : L"\r\n";
+		return out;
+	};
+	job->metaJson =
+		L"{\r\n" +
+		jsonField(L"client", L"DzjsTrainer", true) +
+		jsonField(L"version", DisplayVersion(ReadOwnFileVersion()), true) +
+		jsonField(L"build", JTBuildDateWide(), true) +
+		jsonField(L"environment", JTRunEnvDetail(), true) +
+		jsonField(L"description", description, true) +
+		jsonField(L"repro", repro, true) +
+		jsonField(L"contact", contact, true) +
+		jsonField(L"system", job->systemText, true) +
+		jsonField(L"files", fileList, true) +
+		jsonField(L"submitted_at", stamp, false) +
+		L"}\r\n";
+
+	g_feedbackJob = job;
+	auto* holder = new std::shared_ptr<FeedbackJob>(job);
+	HANDLE thread = CreateThread(nullptr, 0, FeedbackUploadThreadProc, holder, 0, nullptr);
+	if (thread) {
+		CloseHandle(thread);
+	}
+	else {
+		delete holder;
+		g_feedbackJob.reset();
+		feedbackSubmitting = false;
+		feedbackSubmitFailed = true;
+		feedbackStatus = L"无法启动上传线程。";
+		InvalidateRect(_hWnd, nullptr, FALSE);
+	}
+}
+
+void MainWindow::OnFeedbackSubmitted()
+{
+	std::shared_ptr<FeedbackJob> job = g_feedbackJob;
+	g_feedbackJob.reset();
+	if (!job) return;
+	bool ok = false;
+	std::wstring message;
+	{
+		std::lock_guard<std::mutex> guard(job->mutex);
+		ok = job->ok;
+		message = job->message;
+	}
+	feedbackSubmitting = false;
+	feedbackSubmitFailed = !ok;
+	feedbackStatus = message;
+	if (ok) {
+		CloseFeedbackDialog();
+		ShowFastTip(L"反馈已提交，谢谢");
+		return;
+	}
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+int MainWindow::HitFeedbackDialogAt(POINT point) const
+{
+	if (!feedbackDialogVisible) return -1;
+	if (Hit(feedbackSubmitRect, point)) return kFeedbackSubmit;
+	if (Hit(feedbackCancelRect, point)) return kFeedbackCancel;
+	return -1;
+}
+
+bool MainWindow::HandleFeedbackDialogClick(POINT point)
+{
+	if (!feedbackDialogVisible) return false;
+	const int target = HitFeedbackDialogAt(point);
+	if (target == kFeedbackSubmit) SubmitFeedback();
+	else if (target == kFeedbackCancel) CloseFeedbackDialog();
+	// 点在卡片外面什么也不做：这里装着用户刚敲进去的几百字，
+	// 误点一下就把内容丢掉，比"关不掉"更难受。
+	return true;
+}
+
+// 反馈弹窗的焦点环：0/1/2 是三个输入框，3 是提交、4 是取消。输入框有原生焦点
+// 和光标，按钮的焦点环画在主窗口上，所以这里要来回换 SetFocus 的目标 ——
+// 两边各管一段，但必须是同一个环，否则从按钮回不到输入框，键盘用户就卡在环里。
+void MainWindow::CycleFeedbackFocus(int from, int step)
+{
+	HWND fields[3] = { feedbackDescEdit, feedbackReproEdit, feedbackContactEdit };
+	int next = ((from + step) % 5 + 5) % 5;
+	// 输入框没建出来时跳过那一站，不要停在空处。
+	for (int guard = 0; guard < 5 && next < 3 && !fields[next]; ++guard) {
+		next = ((next + step) % 5 + 5) % 5;
+	}
+	if (next < 3 && fields[next]) {
+		focusTarget = -1;
+		SetFocus(fields[next]);
+		// 输入框那圈高亮是按 GetFocus() 现算的，焦点一换就得重画。
+		InvalidateRect(_hWnd, nullptr, FALSE);
+		return;
+	}
+	focusTarget = next == 3 ? kFeedbackSubmit : kFeedbackCancel;
+	SetFocus(_hWnd);
+	InvalidateRect(_hWnd, nullptr, FALSE);
+}
+
+LRESULT CALLBACK MainWindow::FeedbackEditProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	MainWindow* self = currentMainWindow;
+	if (self && message == WM_KEYDOWN) {
+		if (wParam == VK_ESCAPE) {
+			self->CloseFeedbackDialog();
+			return 0;
+		}
+		if (wParam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+			self->SubmitFeedback();
+			return 0;
+		}
+		if (wParam == VK_TAB) {
+			// 多行 EDIT 默认把 Tab 当制表符，这里改成在三个框和两颗按钮之间转圈。
+			HWND order[3] = { self->feedbackDescEdit, self->feedbackReproEdit, self->feedbackContactEdit };
+			int current = 0;
+			for (int i = 0; i < 3; ++i) if (order[i] == hwnd) current = i;
+			self->CycleFeedbackFocus(current, (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+			return 0;
+		}
+	}
+	if (self && self->feedbackEditProc)
+		return CallWindowProcW(self->feedbackEditProc, hwnd, message, wParam, lParam);
+	return DefWindowProcW(hwnd, message, wParam, lParam);
+}
+
+// 系统信息采一份纯文本快照。写进包里是给人看的 —— 用户在反馈里说"注入失败"，
+// 这里能立刻看出是 Win11 还是 Win7、是不是 32 位进程、驱动到底加载没有。
+std::wstring MainWindow::BuildFeedbackSystemInfo()
+{
+	std::wstring text;
+	auto add = [&text](const wchar_t* label, const std::wstring& value) {
+		if (value.empty()) return;
+		text += label;
+		text += L"\t";
+		text += value;
+		text += L"\r\n";
+	};
+
+	add(L"程序版本", DisplayVersion(ReadOwnFileVersion()));
+	add(L"构建时间", JTBuildDateWide());
+	add(L"运行环境", JTRunEnvDetail());
+
+	wchar_t buffer[160] = {};
+	const UINT dpi = QueryWindowDpi(_hWnd);
+	swprintf_s(buffer, L"%u (%u%%)", dpi, dpi * 100 / 96);
+	add(L"窗口 DPI", buffer);
+	swprintf_s(buffer, L"%d x %d", GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
+	add(L"屏幕分辨率", buffer);
+	add(L"CPU", QueryCpuName());
+
+	MEMORYSTATUSEX memory{};
+	memory.dwLength = sizeof(memory);
+	if (GlobalMemoryStatusEx(&memory)) {
+		swprintf_s(buffer, L"%.1f GB", memory.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+		add(L"物理内存", buffer);
+	}
+
+	// 驱动状态用 CurrentDriverStatus()：XDriverLoaded() 只看本进程有没有设备句柄，
+	// 驱动被别的实例加载时会误报"没装"。
+	const DriverStatusInfo& driver = CurrentDriverStatus();
+	std::wstring driverText;
+	if (driver.handleOpen) {
+		driverText = driver.serviceName.empty() ? L"已加载" : (L"已加载 · " + driver.serviceName);
+	}
+	else if (driver.serviceRunning) {
+		driverText = driver.serviceName.empty() ? L"服务在运行，本进程未连接"
+			: (L"服务 " + driver.serviceName + L" 在运行，本进程未连接");
+	}
+	else if (driver.serviceExists) {
+		driverText = driver.serviceName.empty() ? L"服务已安装，未运行"
+			: (L"服务 " + driver.serviceName + L" 已安装，未运行");
+	}
+	else {
+		driverText = L"未安装";
+	}
+	add(L"主驱动", driverText);
+	add(L"自我保护", advSelfProtect ? L"已开启" : L"已关闭");
+
+	int blocked = 0;
+	if (setProhibitKillProcess) ++blocked;
+	if (setProhibitCloseWindow) ++blocked;
+	if (setBandAllRunOp) ++blocked;
+	if (setBlockWindowOps) ++blocked;
+	if (setBlockDriverAccess) ++blocked;
+	swprintf_s(buffer, L"%d / 5 项", blocked);
+	add(L"拦截策略", buffer);
+
+	std::wstring hostText;
+	if (studentRunning) {
+		swprintf_s(buffer, L"StudentMain.exe · PID %lu", static_cast<unsigned long>(studentPid));
+		hostText = buffer;
+	}
+	else if (eduHostCount > 0) {
+		hostText = L"其他教室 " + std::to_wstring(eduHostCount) + L" 个";
+	}
+	else if (!eduHostSummary.empty()) {
+		hostText = L"待接管（进程在运行）";
+	}
+	else {
+		hostText = L"未运行";
+	}
+	add(L"教室接管", hostText);
+
+	add(L"日志目录", std::wstring(JTAppGetCurrentDirDirect() ? JTAppGetCurrentDirDirect() : L"")
+		+ L"\\logs");
+	return text;
 }
 
 // 进程选择器：和更新弹窗同一套模态骨架（scrim / 28 圆角 / 24 内边距），
@@ -7091,16 +8605,9 @@ void MainWindow::StopAvProcessScan()
 {
 	if (avScanCancelEvent) SetEvent(avScanCancelEvent);
 	if (avScanThread) {
-		// 取消只靠驱动协作响应，INFINITE 等待会让退出流程永久卡在
-		// WM_DESTROY 里。等不到就放弃这个句柄，让进程正常退出。
-		const DWORD waitResult = WaitForSingleObject(avScanThread, 5000);
-		if (waitResult == WAIT_OBJECT_0) {
-			CloseHandle(avScanThread);
-			avScanThread = nullptr;
-		}
-		else if (currentLogger) {
-			currentLogger->LogWarn(L"AV scan thread did not stop within 5s; leaving it detached");
-		}
+		WaitForSingleObject(avScanThread, INFINITE);
+		CloseHandle(avScanThread);
+		avScanThread = nullptr;
 	}
 	if (avScanCancelEvent) {
 		CloseHandle(avScanCancelEvent);
@@ -7382,6 +8889,7 @@ int MainWindow::HitTargetAt(POINT point)
 	if (page == Page::Logs && Hit(exportLogRect, point)) target = 40;
 	if (page == Page::Injection) {
 		for (int i = 0; i < 3; ++i) if (Hit(customInjectRects[i], point)) target = 110 + i;
+		if (Hit(eduCompatToggleRect, point)) target = 113;
 	}
 	if (Hit(themeRect, point)) target = 41;
 	if ((page == Page::Protection || page == Page::Replacement) && Hit(advancedSettingsRect, point)) target = 42;
@@ -7406,6 +8914,7 @@ int MainWindow::HitTargetAt(POINT point)
 	if (page == Page::Network && Hit(networkProjectRect, point)) target = 72;
 	if (page == Page::About) {
 		if (Hit(aboutUpdateRect, point)) target = 74;
+		if (Hit(aboutFeedbackRect, point)) target = kAboutFeedback;
 		if (Hit(aboutExitRect, point)) target = 73;
 	}
 	if (page == Page::Diagnostics) {
@@ -7431,6 +8940,11 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 	case kProcessPickerSecondary: found = processPickerSecondaryRect; break;
 	case kProcessPickerRefresh: found = processPickerRefreshRect; break;
 	case kProcessPickerSelectAll: found = processPickerSelectAllRect; break;
+	// 面板上的按钮：Tab 转过去之后 ActivateFocus() 也是靠这里取矩形再仿一次点击，
+	// 漏一个就等于那颗按钮只能鼠标点。
+	case kProtectDialogClose: found = protectDialogCloseRect; break;
+	case kFeedbackCancel: found = feedbackCancelRect; break;
+	case kFeedbackSubmit: found = feedbackSubmitRect; break;
 	case 0: case 1: case 2: case 3: case 4:
 	case 5: case 6: case 7: case 8: case 9:
 		found = navRects[target];
@@ -7462,11 +8976,13 @@ bool MainWindow::TargetRect(int target, RECT* rect) const
 	case 64: case 65: case 66: found = advancedKillRects[target - 64]; break;
 	case 67: case 68: found = advancedInjectRects[target - 67]; break;
 	case 110: case 111: case 112: found = customInjectRects[target - 110]; break;
+	case 113: found = eduCompatToggleRect; break;
 	case 69: found = advancedSaveRect; break;
 	case 70: case 71: found = advancedTabRects[target - 70]; break;
 	case 72: found = networkProjectRect; break;
 	case 73: found = aboutExitRect; break;
 	case 74: found = aboutUpdateRect; break;
+	case kAboutFeedback: found = aboutFeedbackRect; break;
 	case 75: found = temporaryVideoEnableRect; break;
 	case 76: found = temporaryVideoImageModeRect; break;
 	case 77: found = temporaryVideoFileModeRect; break;
@@ -7498,6 +9014,17 @@ std::vector<int> MainWindow::FocusableTargets() const
 		if (TargetRect(kProcessPickerSecondary, nullptr)) list.push_back(kProcessPickerSecondary);
 		if (TargetRect(kProcessPickerSelectAll, nullptr)) list.push_back(kProcessPickerSelectAll);
 		if (TargetRect(kProcessPickerRefresh, nullptr)) list.push_back(kProcessPickerRefresh);
+		return list;
+	}
+	if (FeedbackDialogVisible()) {
+		// 输入框不在这个列表里：Tab 由 EDIT 自己的子类化处理，转给它们反而会
+		// 把焦点环画到按钮上、和输入光标打架。
+		if (!IsRectEmpty(&feedbackSubmitRect)) list.push_back(kFeedbackSubmit);
+		if (!IsRectEmpty(&feedbackCancelRect)) list.push_back(kFeedbackCancel);
+		return list;
+	}
+	if (ProtectDialogVisible()) {
+		if (!IsRectEmpty(&protectDialogCloseRect)) list.push_back(kProtectDialogClose);
 		return list;
 	}
 	if (UpdateDialogVisible()) {
@@ -7556,7 +9083,7 @@ std::vector<int> MainWindow::FocusableTargets() const
 		push(40);
 		break;
 	case Page::About:
-		push(74); push(73);
+		push(74); push(kAboutFeedback); push(73);
 		break;
 	case Page::Injection:
 		for (int i = 0; i < 3; ++i) push(110 + i);
@@ -7618,6 +9145,26 @@ void MainWindow::UpdateHover(POINT point)
 		UpdateProcessPickerHover(point);
 		return;
 	}
+	if (FeedbackDialogVisible()) {
+		const int dialogTarget = HitFeedbackDialogAt(point);
+		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
+		if (dialogTarget != hoverTarget) {
+			hoverTarget = dialogTarget;
+			EnsureAnimationTimer();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+		}
+		return;
+	}
+	if (ProtectDialogVisible()) {
+		const int dialogTarget = HitProtectDialogAt(point);
+		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
+		if (dialogTarget != hoverTarget) {
+			hoverTarget = dialogTarget;
+			EnsureAnimationTimer();
+			InvalidateRect(_hWnd, nullptr, FALSE);
+		}
+		return;
+	}
 	if (UpdateDialogVisible()) {
 		const int dialogTarget = HitUpdateDialogAt(point);
 		SetCursor(LoadCursorW(nullptr, dialogTarget >= 0 ? IDC_HAND : IDC_ARROW));
@@ -7647,6 +9194,14 @@ void MainWindow::HandleClick(POINT point)
 		HandleProcessPickerClick(point);
 		return;
 	}
+	if (FeedbackDialogVisible()) {
+		HandleFeedbackDialogClick(point);
+		return;
+	}
+	if (ProtectDialogVisible()) {
+		HandleProtectDialogClick(point);
+		return;
+	}
 	if (UpdateDialogVisible()) {
 		HandleUpdateDialogClick(point);
 		return;
@@ -7666,6 +9221,17 @@ void MainWindow::HandleClick(POINT point)
 	}
 	for (int i = 0; i < kNavCount; ++i) if (Hit(navRects[i], point)) { SelectPage(static_cast<Page>(i)); return; }
 	if (page == Page::Injection) {
+		if (Hit(eduCompatToggleRect, point)) {
+			eduCompatAutoInject = !eduCompatAutoInject;
+			// 落盘给注入端读，再直接改工作线程的开关，不用等下一次重读 ini。
+			JTAppGetSettingsDirect()->SetSettingBool(L"EduCompatAutoInject", eduCompatAutoInject);
+			if (currentWorker) currentWorker->SetEduCompatAutoInject(eduCompatAutoInject);
+			ShowFastTip(eduCompatAutoInject
+				? L"已开启：识别到其他电子教室学生端会自动注入"
+				: L"已关闭：不再自动注入新进程，已注入的继续生效");
+			InvalidateRect(_hWnd, nullptr, FALSE);
+			return;
+		}
 		for (int i = 0; i < 3; ++i) if (Hit(customInjectRects[i], point)) {
 			if (i == 2) {
 				if (currentWorker) customInjectList = currentWorker->GetCustomInjectedList();
@@ -7679,6 +9245,10 @@ void MainWindow::HandleClick(POINT point)
 		CheckForUpdate(true);
 		return;
 	}
+	if (page == Page::About && Hit(aboutFeedbackRect, point)) {
+		OpenFeedbackDialog();
+		return;
+	}
 	if (page == Page::About && Hit(aboutExitRect, point)) {
 		OnWmCommand(CMD_POWER_EXIT);
 		return;
@@ -7686,9 +9256,13 @@ void MainWindow::HandleClick(POINT point)
 	if (page == Page::Overview) {
 		for (int i = 0; i < 5; ++i) if (Hit(actionRects[i], point)) {
 			switch (i) {
-			case 0: ShowFastTip(currentControlled ? L"\u5f53\u524d\u5df2\u542f\u7528\u5b8c\u6574\u9632\u62a4\u3002" : L"\u9632\u62a4\u670d\u52a1\u6b63\u5728\u76d1\u63a7\u3002"); break;
+			case 0: OpenProtectDialog(); break;
 			case 1: RequestSuperTopmost(); break;
-			case 2: if (currentWorker) { if (studentRunning) currentWorker->Kill(); else currentWorker->Rerun(); } break;
+			// 「电子教室操作」弹选择框：机器上可能同时接着极域、红蜘蛛、伽卡他卡，
+			// 直接全停容易误伤，交给用户挑。结束和启动都在这一个菜单里。
+			case 2:
+				ShowEduMenu();
+				break;
 			case 3: SelectPage(Page::Protection); break;
 			case 4: ShowPowerMenu(); break;
 			}
@@ -8170,16 +9744,8 @@ void MainWindow::StartUpdateDownload()
 		FailUpdateDialog(L"无法取得临时目录");
 		return;
 	}
-	// version 来自远端清单，直接拼进路径等于让清单决定删/写哪个文件。
-	std::wstring safeVersion;
-	for (wchar_t ch : updateDialog.version) {
-		const bool ok = (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'z') ||
-			(ch >= L'A' && ch <= L'Z') || ch == L'.' || ch == L'-' || ch == L'_';
-		safeVersion.push_back(ok ? ch : L'_');
-	}
-	if (safeVersion.empty()) safeVersion = L"latest";
 	const std::wstring packagePath = std::wstring(tempDir) +
-		L"DzjsTrainer-" + safeVersion + L"-update.exe";
+		L"DzjsTrainer-" + updateDialog.version + L"-update.exe";
 	DeleteFileW(packagePath.c_str());
 
 	auto* context = new (std::nothrow) UpdateDownloadContext();
@@ -8331,8 +9897,9 @@ void MainWindow::LayoutAdvancedControls()
 	RECT client{};
 	GetClientRect(_hWnd, &client);
 	const bool showCompat = page == Page::Advanced && advancedTab == 1;
-	// 和 PaintAdvanced 用同一组公式；输入框缩进圆角框内 4px。
-	MoveWindow(advancedControls[2], client.right - 238, 286, 182, 30, TRUE);
+	// 和 PaintAdvanced 用同一组公式（逻辑像素）；输入框缩进圆角框内 4px。
+	MoveWindow(advancedControls[2], ToPhysical(ToLogical(client.right) - 238), ToPhysical(286),
+		ToPhysical(182), ToPhysical(30), TRUE);
 	ShowWindow(advancedControls[2], showCompat ? SW_SHOW : SW_HIDE);
 }
 
@@ -8454,7 +10021,9 @@ void MainWindow::CreateNetworkControls()
 	controlSurfaceBrush = CreateSolidBrush(darkMode ? RGB(38, 45, 42) : RGB(255, 255, 255));
 	advancedFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
 	processPickerFieldBrush = CreateSolidBrush(darkMode ? RGB(26, 33, 30) : RGB(255, 255, 255));
-	controlFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+	// 像素高度必须跟着当前 DPI 走：RebuildControlFont 只在 WM_DPICHANGED 里调用，
+	// 首帧若还是写死 -14，150% 下原生控件里的字会明显比周边自绘文字小一圈。
+	controlFont = CreateFontW(-ToPhysical(14), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
 		OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
 		DEFAULT_PITCH | FF_DONTCARE, L"Microsoft YaHei UI");
 	auto make = [this](int index, LPCWSTR cls, LPCWSTR text, DWORD style, int id, DWORD exStyle = 0) {
@@ -8490,8 +10059,10 @@ void MainWindow::CreateNetworkControls()
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_REFRESH)), JTAppGetInstanceDirect(), nullptr);
 	teacherViewButton = CreateWindowExW(0, L"BUTTON", L"\u5b9e\u65f6\u753b\u9762", WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_VIEW)), JTAppGetInstanceDirect(), nullptr);
+	// LBS_NOTIFY 不能省：没有它 LBN_SELCHANGE 根本不会发，点选学生后
+	// selected_ip 一直是旧值，「实时画面」要等下一次刷新列表才跟上。
 	teacherStudentList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-		WS_CHILD | WS_TABSTOP | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
+		WS_CHILD | WS_TABSTOP | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_STUDENTS)), JTAppGetInstanceDirect(), nullptr);
 	teacherChatInput = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"\u8bf7\u8ba4\u771f\u542c\u8bfe", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL,
 		0, 0, 10, 10, _hWnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_TEACHER_CHAT_INPUT)), JTAppGetInstanceDirect(), nullptr);
@@ -8524,13 +10095,16 @@ void MainWindow::LayoutNetworkControls()
 	if (!networkControls[0]) return;
 	RECT client{};
 	GetClientRect(_hWnd, &client);
+	// 公式按逻辑像素算，MoveWindow 之前再换成物理像素。
+	const int clientWidth = ToLogical(client.right);
+	const int clientHeight = ToLogical(client.bottom);
 	const bool visible = false;
 	const int x = 280;
 	const int y = 185;
-	const int w = client.right > 308 ? static_cast<int>(client.right - 308) : 596;
+	const int w = clientWidth > 308 ? static_cast<int>(clientWidth - 308) : 596;
 	const int fieldW = std::max(174, w - 422);
 	auto place = [&](int index, int px, int py, int pw, int ph) {
-		MoveWindow(networkControls[index], px, py, pw, ph, TRUE);
+		MoveWindow(networkControls[index], ToPhysical(px), ToPhysical(py), ToPhysical(pw), ToPhysical(ph), TRUE);
 		ShowWindow(networkControls[index], visible ? SW_SHOW : SW_HIDE);
 	};
 	for (int index : { 0, 2, 5, 8 }) ShowWindow(networkControls[index], SW_HIDE);
@@ -8544,43 +10118,51 @@ void MainWindow::LayoutNetworkControls()
 	place(11, x, y + 199, 126, 36);
 	place(12, x + 136, y + 199, 84, 36);
 	place(13, x + 230, y + 199, 84, 36);
-	place(14, x, y + 291, w, std::max(72, static_cast<int>(client.bottom) - y - 319));
+	place(14, x, y + 291, w, std::max(72, clientHeight - y - 319));
 	LayoutTeacherControls();
 }
 
 void MainWindow::LayoutTeacherControls()
 {
 	if (!teacherLaunchButton) return;
+	{
 	RECT client{};
 	GetClientRect(_hWnd, &client);
-	// 布局常量都是 96 DPI 的逻辑值；原生控件要按 dpiScale 换算成物理像素，
-	// 否则 150% 缩放下控件会飘到自绘卡片的左上角。
-	const int logicalWidth = static_cast<int>(client.right / (dpiScale > 0 ? dpiScale : 1.0));
-	const int logicalHeight = static_cast<int>(client.bottom / (dpiScale > 0 ? dpiScale : 1.0));
+	const int clientWidth = ToLogical(client.right);
+	const int clientHeight = ToLogical(client.bottom);
+	const bool visible = page == Page::Network;
+	const int hostX = 264;
+	const int hostY = 170;
+	const int hostW = std::max(560, clientWidth - hostX - 24);
+	const int hostH = std::max(320, clientHeight - hostY - 24);
+	if (teacherHostWindow) {
+		MoveWindow(teacherHostWindow, ToPhysical(hostX), ToPhysical(hostY), ToPhysical(hostW), ToPhysical(hostH), TRUE);
+		// 只在真正嵌入原教师端窗口时才显示宿主框。没有嵌入时它是一个空的
+		// WS_EX_CLIENTEDGE STATIC，会盖住 PaintNetwork 画好的圆角卡片。
+		const bool hostVisible = visible && teacherChildWindow != nullptr && IsWindow(teacherChildWindow);
+		ShowWindow(teacherHostWindow, hostVisible ? SW_SHOW : SW_HIDE);
+	}
+	MoveWindow(teacherLaunchButton, ToPhysical(hostX), ToPhysical(120), ToPhysical(144), ToPhysical(34), TRUE);
+	ShowWindow(teacherLaunchButton, visible ? SW_SHOW : SW_HIDE);
+	for (HWND control : { teacherRefreshButton, teacherViewButton, teacherStudentList, teacherChatInput, teacherChatButton,
+		teacherBlackButton, teacherUnlockButton, teacherShutdownButton, teacherRebootButton })
+		if (control) ShowWindow(control, SW_HIDE);
+	LayoutEmbeddedTeacherGui();
+	return;
+	}
+	RECT client{};
+	GetClientRect(_hWnd, &client);
 	const bool visible = page == Page::Network;
 	const int left = 280;
 	const int top = 184;
-	const int right = std::max(left + 520, logicalWidth - 28);
+	const int right = std::max(left + 520, static_cast<int>(client.right) - 28);
 	const int listRight = left + std::min(520, std::max(420, (right - left) * 46 / 100));
-	const int listBottom = std::max(top + 240, logicalHeight - 36);
-	auto show = [this, visible](HWND window, int x, int y, int width, int height) {
+	const int listBottom = std::max(top + 240, static_cast<int>(client.bottom) - 36);
+	auto show = [visible](HWND window, int x, int y, int w, int h) {
 		if (!window) return;
-		MoveWindow(window, Scale(x), Scale(y), Scale(width), Scale(height), TRUE);
+		MoveWindow(window, x, y, w, h, TRUE);
 		ShowWindow(window, visible ? SW_SHOW : SW_HIDE);
 	};
-
-	// 内置控制台模式下宿主框要给控制台留位置；FLTK 版嵌入时则由
-	// LayoutEmbeddedTeacherGui 按真实客户区铺满。
-	if (teacherHostWindow) {
-		const int hostX = 264, hostY = 170;
-		const int hostW = std::max(560, logicalWidth - hostX - 24);
-		const int hostH = std::max(320, logicalHeight - hostY - 24);
-		MoveWindow(teacherHostWindow, Scale(hostX), Scale(hostY), Scale(hostW), Scale(hostH), TRUE);
-		const bool hostVisible = visible &&
-			((teacherChildWindow != nullptr && IsWindow(teacherChildWindow)) || teacherConsoleMode);
-		ShowWindow(teacherHostWindow, hostVisible ? SW_SHOW : SW_HIDE);
-	}
-
 	show(teacherLaunchButton, left, 120, 170, 34);
 	show(teacherRefreshButton, left + 182, 120, 120, 34);
 	show(teacherViewButton, left + 314, 120, 120, 34);
@@ -8593,13 +10175,9 @@ void MainWindow::LayoutTeacherControls()
 	show(teacherUnlockButton, actionLeft + 138, top + 106, 100, 36);
 	show(teacherShutdownButton, actionLeft, top + 162, 100, 36);
 	show(teacherRebootButton, actionLeft + 112, top + 162, 100, 36);
-
 	const auto viewState = teacherBackend && teacherBackend->running && !teacherBackend->selected_ip.empty()
 		? teacherBackend->service.remoteViewState(teacherBackend->selected_ip) : jiyu::RemoteViewState{};
 	if (teacherViewButton) SetWindowTextW(teacherViewButton, viewState.active ? L"\u505c\u6b62\u753b\u9762" : L"\u5b9e\u65f6\u753b\u9762");
-
-	if (teacherConsoleMode) LayoutTeacherConsole();
-	else LayoutEmbeddedTeacherGui();
 }
 
 static std::wstring teacherUtf8ToWide(const std::string& text)
@@ -8824,8 +10402,9 @@ bool MainWindow::AttachEmbeddedTeacherGui()
 	SetWindowPos(teacherChildWindow, HWND_TOP, 0, 0, 0, 0,
 		SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 	ShowWindow(teacherChildWindow, SW_SHOW);
-	SetWindowTextW(teacherLaunchButton, L"\u5173\u95ed\u6559\u5e08\u7aef");
+	SetWindowTextW(teacherLaunchButton, L"关闭教师端");
 	teacherLaunchPending = false;
+	teacherStandalone = false;
 	teacherLaunchDeadline = 0;
 	LayoutEmbeddedTeacherGui();
 	AppendNetworkResult(L"\u6559\u5e08\u7aef\u5df2\u5d4c\u5165\u5230\u7f51\u7edc\u5de5\u5177");
@@ -8839,14 +10418,9 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 		StopEmbeddedTeacherGui();
 		return;
 	}
-	// 路径可能超过 MAX_PATH（用户目录很深时），用大缓冲并检查返回值，
-	// 否则 GetModuleFileNameW 会截断，拼出来的候选路径必然不存在。
-	std::vector<wchar_t> modulePath(32768, L'\0');
-	const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath.data(),
-		static_cast<DWORD>(modulePath.size()));
-	std::wstring base = moduleLength > 0
-		? std::wstring(modulePath.data(), moduleLength)
-		: std::wstring();
+	wchar_t modulePath[MAX_PATH]{};
+	GetModuleFileNameW(nullptr, modulePath, _countof(modulePath));
+	std::wstring base = modulePath;
 	const size_t slash = base.find_last_of(L"\\/");
 	base = slash == std::wstring::npos ? L"." : base.substr(0, slash);
 	std::vector<std::wstring> candidates = {
@@ -8855,59 +10429,84 @@ void MainWindow::LaunchEmbeddedTeacherGui()
 	};
 	std::wstring executable;
 	for (const auto& candidate : candidates) {
-		SetLastError(ERROR_SUCCESS);
-		const DWORD attributes = GetFileAttributesW(candidate.c_str());
-		const DWORD attributeError = (attributes == INVALID_FILE_ATTRIBUTES) ? GetLastError() : ERROR_SUCCESS;
-		if (currentLogger) {
-			currentLogger->LogInfo(L"teacher-gui probe: path=%s attrs=0x%08X error=%lu",
-				candidate.c_str(), attributes, attributeError);
-		}
-		if (attributes != INVALID_FILE_ATTRIBUTES) {
+		if (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
 			executable = candidate;
 			break;
 		}
 	}
 	if (executable.empty()) {
-		// 把尝试过的路径直接写进弹窗和日志：下次不用再猜。
-		std::wstring detail = L"\u672a\u627e\u5230 TeacherEndpoint\\JiYuTeacherGui.exe\u3002\n\u5df2\u5c1d\u8bd5\uff1a\n";
-		for (const auto& candidate : candidates) detail += candidate + L"\n";
-		detail += L"\n\u4e3b\u7a0b\u5e8f\u76ee\u5f55\uff1a" + base;
-		if (currentLogger) currentLogger->LogError(L"teacher-gui missing, base=%s", base.c_str());
-		MessageBoxW(_hWnd, detail.c_str(), L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
+		MessageBoxW(_hWnd, L"\u672a\u627e\u5230 TeacherEndpoint\\JiYuTeacherGui.exe\uff0c\u8bf7\u5148\u6784\u5efa\u5e76\u653e\u5165\u4e3b\u7a0b\u5e8f\u76ee\u5f55\u3002", L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
 		return;
 	}
-	if (currentLogger) currentLogger->LogInfo(L"teacher-gui launch: %s", executable.c_str());
+	std::wstring commandLine = L"\"" + executable + L"\"";
 	std::wstring workingDirectory = executable;
 	const size_t executableSlash = workingDirectory.find_last_of(L"\\/");
 	workingDirectory = executableSlash == std::wstring::npos ? base : workingDirectory.substr(0, executableSlash);
-	// 公开版是控制台程序：接管 stdin/stdout 做内置控制台；
-	// 若对端是 FLTK 版，AttachEmbeddedTeacherGui 会把它的窗口挂进来。
-	if (!StartTeacherConsoleProcess(executable, workingDirectory)) {
+	std::vector<wchar_t> command(commandLine.begin(), commandLine.end());
+	command.push_back(L'\0');
+	STARTUPINFOW startup{ sizeof(startup) };
+	startup.dwFlags = STARTF_USESHOWWINDOW;
+	startup.wShowWindow = SW_HIDE;
+	PROCESS_INFORMATION process{};
+	// 不再用 CREATE_NO_WINDOW：那样连控制台都不创建，嵌入失败后没有窗口能交给
+	// 用户。改成创建一个隐藏的控制台，嵌入成功就扫掉，失败就把它显示出来。
+	if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+		CREATE_NEW_PROCESS_GROUP, nullptr, workingDirectory.c_str(), &startup, &process)) {
 		MessageBoxW(_hWnd, L"\u542f\u52a8\u6559\u5e08\u7aef\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5 TeacherEndpoint \u6587\u4ef6\u548c\u4f9d\u8d56\u5e93\u3002", L"\u7f51\u7edc\u5de5\u5177", MB_OK | MB_ICONERROR);
 		return;
 	}
+	CloseHandle(process.hThread);
+	teacherProcess = process.hProcess;
+	teacherProcessId = process.dwProcessId;
+	teacherLaunchPending = true;
+	teacherLaunchDeadline = GetTickCount64() + 10000;
+	SetWindowTextW(teacherLaunchButton, L"\u53d6\u6d88\u542f\u52a8");
 	WaitForInputIdle(teacherProcess, 100);
 	AttachEmbeddedTeacherGui();
+}
+
+void MainWindow::EnterStandaloneTeacherGui()
+{
+	teacherLaunchPending = false;
+	teacherLaunchDeadline = 0;
+	teacherStandalone = true;
+	TeacherStandaloneSearch search{ teacherProcessId, nullptr, nullptr };
+	EnumWindows(FindStandaloneTeacherWindow, reinterpret_cast<LPARAM>(&search));
+	HWND target = search.console ? search.console : search.other;
+	if (target) {
+		ShowWindow(target, SW_SHOW);
+		SetForegroundWindow(target);
+	}
+	if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"关闭教师端");
+	AppendNetworkResult(target
+		? L"教师端没有 FLTK 窗口，已改为独立窗口运行"
+		: L"教师端没有可嵌入的 FLTK 窗口，已在后台独立运行（没有可见窗口）");
+	InvalidateRect(_hWnd, nullptr, FALSE);
 }
 
 void MainWindow::StopEmbeddedTeacherGui()
 {
 	if (teacherChildWindow && IsWindow(teacherChildWindow)) PostMessageW(teacherChildWindow, WM_CLOSE, 0, 0);
+	if (teacherStandalone && teacherProcessId) {
+		// 独立运行的是它自己的窗口，先让它自己收尾，关不掉再结束进程。
+		TeacherStandaloneSearch search{ teacherProcessId, nullptr, nullptr };
+		EnumWindows(FindStandaloneTeacherWindow, reinterpret_cast<LPARAM>(&search));
+		HWND target = search.console ? search.console : search.other;
+		if (target) PostMessageW(target, WM_CLOSE, 0, 0);
+	}
 	if (teacherProcess) {
 		if (WaitForSingleObject(teacherProcess, 1200) == WAIT_TIMEOUT)
 			TerminateProcess(teacherProcess, 0);
 		WaitForSingleObject(teacherProcess, 1000);
 		CloseHandle(teacherProcess);
 	}
-	// 进程先退出，读线程才会从 ReadFile 结束；顺序反了会把管道句柄
-	// 在别人还读着的时候关掉。
-	CloseTeacherConsole();
 	teacherProcess = nullptr;
 	teacherProcessId = 0;
 	teacherChildWindow = nullptr;
 	teacherLaunchPending = false;
+	teacherStandalone = false;
 	teacherLaunchDeadline = 0;
-	if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u542f\u52a8\u6559\u5e08\u7aef");
+	if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"启动教师端");
 	InvalidateRect(_hWnd, nullptr, FALSE);
 }
 
@@ -8920,20 +10519,18 @@ void MainWindow::PollEmbeddedTeacherGui()
 		teacherProcess = nullptr;
 		teacherProcessId = 0;
 		teacherChildWindow = nullptr;
-		// 教师端自己退出时也要收掉管道与读线程，否则下次启动会覆盖
-		// 句柄，旧线程还会继续往新控制台里灌输出。
-		CloseTeacherConsole();
 		teacherLaunchPending = false;
+		teacherStandalone = false;
 		teacherLaunchDeadline = 0;
-		if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u542f\u52a8\u6559\u5e08\u7aef");
-		AppendNetworkResult(L"\u6559\u5e08\u7aef\u5df2\u9000\u51fa");
+		if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"启动教师端");
+		AppendNetworkResult(L"教师端已退出");
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
 	}
 	// The endpoint can create its console after the FLTK window. Sweep on every
 	// timer tick so a late console cannot remain visible after embedding.
-	TeacherWindowSearch consoleSweep{ teacherProcessId, nullptr,
-		teacherLaunchPending || teacherChildWindow != nullptr };
+	// 独立运行时反过来，控制台是用户唯一能操作的窗口，必须留着。
+	TeacherWindowSearch consoleSweep{ teacherProcessId, nullptr, !teacherStandalone };
 	EnumWindows(FindTeacherWindow, reinterpret_cast<LPARAM>(&consoleSweep));
 	if (teacherChildWindow && !IsWindow(teacherChildWindow)) {
 		teacherChildWindow = nullptr;
@@ -8943,17 +10540,10 @@ void MainWindow::PollEmbeddedTeacherGui()
 	if (!teacherChildWindow) {
 		if (AttachEmbeddedTeacherGui()) return;
 		if (teacherLaunchPending && teacherLaunchDeadline && GetTickCount64() >= teacherLaunchDeadline) {
-			// 不是失败：这个版本没有 FLTK 窗口（Python 控制台版就是如此）。
-			// 进程继续跑，只是不嵌入，按钮改成「关闭教师端」。
-			teacherLaunchPending = false;
-			teacherLaunchDeadline = 0;
-			if (currentLogger) {
-				currentLogger->LogWarn(L"teacher-gui: no FLTK window after timeout; running standalone (pid=%lu)",
-					teacherProcessId);
-			}
-			AppendNetworkResult(L"\u6559\u5e08\u7aef\u5df2\u542f\u52a8\uff08\u6b64\u7248\u672c\u65e0\u5d4c\u5165\u754c\u9762\uff0c\u6b63\u5728\u72ec\u7acb\u7a97\u53e3\u8fd0\u884c\uff09");
-			ShowFastTip(L"\u6559\u5e08\u7aef\u4ee5\u72ec\u7acb\u7a97\u53e3\u8fd0\u884c");
-			if (teacherLaunchButton) SetWindowTextW(teacherLaunchButton, L"\u5173\u95ed\u6559\u5e08\u7aef");
+			// 不再 TerminateProcess：非 FLTK 的教师端（公开的 Python 版）根本没有
+			// FLTK 窗口，杀掉它等于把唯一能用的界面也一起收走。
+			EnterStandaloneTeacherGui();
+			ShowFastTip(L"教师端未提供可嵌入窗口，已独立运行");
 		}
 		return;
 	}
@@ -9029,23 +10619,500 @@ void MainWindow::HandleNetworkCommand(int command)
 	AppendNetworkResult(L"\u64cd\u4f5c\u5df2\u63d0\u4ea4");
 }
 
+// ============================================================================
+// 弹出菜单（Material 3）
+//
+// 原来这两处菜单都交给 TrackPopupMenu：方角、系统字体、灰底，跟整套圆角卡片
+// 摆在一起像从别的程序里借来的。这里自己画一份：色调表面、16 圆角、悬停与
+// 按下各压一层状态层，行高 42，键盘上下键 / 回车 / Esc 都能用。
+//
+// 窗口是分层的（UpdateLayeredWindow），圆角和投影才不会被方形窗口裁掉。
+// 绘制走 GDI+ 的 Bitmap 而不是 DIB 的 DC：往 DC 上画时 GDI+ 不保证写 alpha，
+// 分层窗口拿到的就是一块不透明的方块。画完 LockBits 拷进 DIB，顺便把颜色
+// 乘上 alpha 变成预乘 —— 不乘的话圆角边缘会挂一圈发白。
+// ============================================================================
+namespace {
+
+constexpr int kMd3MenuPad = 6;
+constexpr int kMd3ItemHeight = 42;
+constexpr int kMd3SeparatorHeight = 11;
+constexpr int kMd3Radius = 16;
+constexpr int kMd3TextInset = 16;
+constexpr float kMd3FontSize = 13.0f;
+constexpr wchar_t kMd3MenuClass[] = L"DzjsTrainerMd3Menu";
+
+struct Md3MenuItem {
+	std::wstring label;
+	UINT command = 0;
+	bool separator = false;
+	bool danger = false;
+};
+
+struct Md3MenuState {
+	HWND window = nullptr;
+	HWND owner = nullptr;
+	bool dark = false;
+	float scale = 1.0f;
+	std::vector<Md3MenuItem> items;
+	std::vector<int> tops;        // 每条目在逻辑坐标里的 y，分隔条也占一行
+	int widthLogical = 0;
+	int heightLogical = 0;
+	int widthPhysical = 0;
+	int heightPhysical = 0;
+	POINT origin{};               // 物理坐标
+	HBITMAP bitmap = nullptr;     // 提交给 UpdateLayeredWindow 的 DIB
+	HDC memoryDc = nullptr;
+	void* bits = nullptr;
+	int hover = -1;
+	int pressed = -1;
+	UINT result = 0;
+	bool finished = false;
+};
+
+// 命中判定要看 x，不能只看 y。菜单自己拿着鼠标捕获（SetCapture），光标从左右
+// 两侧移出去之后消息还在往这个窗口送，只看 y 的话那一行会一直亮着；同样的原因，
+// 在外面点一下也会被判成点中某一行，那就是误执行。
+int Md3ItemAt(const Md3MenuState& state, int logicalX, int logicalY)
+{
+	if (logicalX < kMd3MenuPad || logicalX >= state.widthLogical - kMd3MenuPad) return -1;
+	for (size_t i = 0; i < state.items.size(); ++i) {
+		const int top = state.tops[i];
+		const int height = state.items[i].separator ? kMd3SeparatorHeight : kMd3ItemHeight;
+		if (logicalY >= top && logicalY < top + height)
+			return state.items[i].separator ? -1 : static_cast<int>(i);
+	}
+	return -1;
+}
+
+// 键盘上下键用：跳过分隔条绕圈找下一个可选项。
+int Md3NextItem(const Md3MenuState& state, int from, int step)
+{
+	const int count = static_cast<int>(state.items.size());
+	if (count == 0) return -1;
+	for (int offset = 1; offset <= count; ++offset) {
+		const int index = ((from + step * offset) % count + count) % count;
+		if (!state.items[index].separator) return index;
+	}
+	return -1;
+}
+
+void Md3Render(Md3MenuState& state)
+{
+	if (state.memoryDc == nullptr) return;
+
+	Bitmap canvas(state.widthPhysical, state.heightPhysical, PixelFormat32bppARGB);
+	{
+		Graphics g(&canvas);
+		if (g.GetLastStatus() != Ok) return;
+		g.SetSmoothingMode(SmoothingModeAntiAlias);
+		g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+		g.Clear(Color(0, 0, 0, 0));
+		g.ScaleTransform(state.scale, state.scale);
+
+		const bool dark = state.dark;
+		const RectF container(0.5f, 0.5f, static_cast<REAL>(state.widthLogical) - 1.0f,
+			static_cast<REAL>(state.heightLogical) - 1.0f);
+		const Color surface = C(dark, 255, 255, 255, 30, 36, 34);
+		const Color outline = C(dark, 222, 228, 224, 58, 66, 62);
+		const Color onSurface = C(dark, 24, 30, 27, 226, 233, 229);
+		const Color dangerText = C(dark, 186, 26, 26, 255, 180, 171);
+		// 状态层按 MD3 的口径：悬停 8%，按下 12% 的主色。
+		const Color hoverLayer = dark ? Color(20, 130, 213, 199) : Color(18, 0, 107, 95);
+		const Color pressLayer = dark ? Color(32, 130, 213, 199) : Color(30, 0, 107, 95);
+
+		SoftShadow(g, container, static_cast<float>(kMd3Radius), dark, 1.3f);
+		FillRound(g, container, static_cast<float>(kMd3Radius), surface);
+		StrokeRound(g, container, static_cast<float>(kMd3Radius), outline);
+
+		for (size_t i = 0; i < state.items.size(); ++i) {
+			const Md3MenuItem& item = state.items[i];
+			const float top = static_cast<float>(state.tops[i]);
+			if (item.separator) {
+				const float y = top + kMd3SeparatorHeight / 2.0f;
+				Pen pen(outline, 1.0f);
+				g.DrawLine(&pen, 16.0f, y, static_cast<REAL>(state.widthLogical) - 16.0f, y);
+				continue;
+			}
+			const RectF row(static_cast<REAL>(kMd3MenuPad), top,
+				static_cast<REAL>(state.widthLogical - kMd3MenuPad * 2), static_cast<REAL>(kMd3ItemHeight));
+			if (static_cast<int>(i) == state.pressed) FillRound(g, row, 11.0f, pressLayer);
+			else if (static_cast<int>(i) == state.hover) FillRound(g, row, 11.0f, hoverLayer);
+			Text(g, item.label.c_str(), row.X + kMd3TextInset, top + 12.0f,
+				row.Width - kMd3TextInset * 2, 18.0f, kMd3FontSize, FontStyleRegular,
+				item.danger ? dangerText : onSurface);
+		}
+	}
+
+	BitmapData data{};
+	const Rect lockRect(0, 0, state.widthPhysical, state.heightPhysical);
+	if (canvas.LockBits(&lockRect, ImageLockModeRead, PixelFormat32bppARGB, &data) != Ok) return;
+	for (int y = 0; y < state.heightPhysical; ++y) {
+		const BYTE* source = static_cast<const BYTE*>(data.Scan0) + static_cast<ptrdiff_t>(y) * data.Stride;
+		BYTE* target = static_cast<BYTE*>(state.bits) + static_cast<ptrdiff_t>(y) * state.widthPhysical * 4;
+		for (int x = 0; x < state.widthPhysical; ++x) {
+			const BYTE alpha = source[x * 4 + 3];
+			// 预乘：分层窗口按 alpha 混合，颜色本身还得先乘一遍。
+			target[x * 4 + 0] = static_cast<BYTE>(source[x * 4 + 0] * alpha / 255);
+			target[x * 4 + 1] = static_cast<BYTE>(source[x * 4 + 1] * alpha / 255);
+			target[x * 4 + 2] = static_cast<BYTE>(source[x * 4 + 2] * alpha / 255);
+			target[x * 4 + 3] = alpha;
+		}
+	}
+	canvas.UnlockBits(&data);
+
+	BLENDFUNCTION blend{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+	SIZE size{ state.widthPhysical, state.heightPhysical };
+	POINT source{ 0, 0 };
+	// pptDst 传 nullptr：位置由 Md3RunMenu 用 SetWindowPos 定，这里只更新内容。
+	// 交给 UpdateLayeredWindow 去移动的话，窗口显示出之后的激活会把位置改掉。
+	UpdateLayeredWindow(state.window, nullptr, nullptr, &size, state.memoryDc, &source, 0, &blend, ULW_ALPHA);
+}
+
+void Md3Dismiss(Md3MenuState* state, UINT command)
+{
+	if (state == nullptr || state->finished) return;
+	state->result = command;
+	state->finished = true;
+	// 真销毁留给消息循环处理完这一条再做，避免在焦点 / 捕获回调里拆自己的窗口。
+	if (IsWindow(state->window)) PostMessageW(state->window, WM_CLOSE, 0, 0);
+}
+
+LRESULT CALLBACK Md3MenuProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+	Md3MenuState* state = reinterpret_cast<Md3MenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+	if (message == WM_NCCREATE) {
+		const CREATESTRUCTW* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+		state = static_cast<Md3MenuState*>(create->lpCreateParams);
+		SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+	}
+	if (state == nullptr) return DefWindowProcW(window, message, wParam, lParam);
+
+	switch (message) {
+	case WM_MOUSEMOVE: {
+		const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)) / state->scale);
+		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
+		const int index = Md3ItemAt(*state, x, y);
+		if (index != state->hover) {
+			state->hover = index;
+			Md3Render(*state);
+		}
+		TRACKMOUSEEVENT track{ sizeof(track), TME_LEAVE, window, 0 };
+		TrackMouseEvent(&track);
+		return 0; }
+	case WM_MOUSELEAVE:
+		if (state->hover != -1) {
+			state->hover = -1;
+			Md3Render(*state);
+		}
+		return 0;
+	case WM_LBUTTONDOWN: {
+		const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)) / state->scale);
+		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
+		state->pressed = Md3ItemAt(*state, x, y);
+		if (state->pressed >= 0) Md3Render(*state);
+		return 0; }
+	case WM_LBUTTONUP: {
+		const int x = static_cast<int>(static_cast<short>(LOWORD(lParam)) / state->scale);
+		const int y = static_cast<int>(static_cast<short>(HIWORD(lParam)) / state->scale);
+		const int index = Md3ItemAt(*state, x, y);
+		const int pressed = state->pressed;
+		state->pressed = -1;
+		if (index >= 0 && index == pressed)
+			Md3Dismiss(state, state->items[index].command);
+		else if (index < 0)
+			Md3Dismiss(state, 0);   // 点在投影或窗口外面：跟系统菜单一样关掉
+		else
+			Md3Render(*state);
+		return 0; }
+	case WM_RBUTTONDOWN:
+		Md3Dismiss(state, 0);
+		return 0;
+	case WM_KEYDOWN:
+		switch (wParam) {
+		case VK_ESCAPE:
+			Md3Dismiss(state, 0);
+			return 0;
+		case VK_RETURN:
+			if (state->hover >= 0) Md3Dismiss(state, state->items[state->hover].command);
+			return 0;
+		case VK_UP:
+		case VK_DOWN: {
+			const int start = state->hover;
+			const int next = Md3NextItem(*state, start < 0 ? (wParam == VK_UP ? 0 : -1) : start,
+				wParam == VK_UP ? -1 : 1);
+			if (next >= 0) {
+				state->hover = next;
+				Md3Render(*state);
+			}
+			return 0; }
+		default: break;
+		}
+		break;
+	case WM_KILLFOCUS:
+		Md3Dismiss(state, 0);
+		return 0;
+	case WM_CAPTURECHANGED:
+		if (reinterpret_cast<HWND>(lParam) != window) Md3Dismiss(state, 0);
+		return 0;
+	case WM_CLOSE:
+		DestroyWindow(window);
+		return 0;
+	case WM_DESTROY:
+		if (GetCapture() == window) ReleaseCapture();
+		state->window = nullptr;
+		return 0;
+	default: break;
+	}
+	return DefWindowProcW(window, message, wParam, lParam);
+}
+
+bool RegisterMd3MenuClass()
+{
+	static bool registered = false;
+	if (registered) return true;
+	WNDCLASSEXW cls{ sizeof(cls) };
+	cls.lpfnWndProc = Md3MenuProc;
+	cls.hInstance = GetModuleHandleW(nullptr);
+	cls.lpszClassName = kMd3MenuClass;
+	cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+	registered = RegisterClassExW(&cls) != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+	return registered;
+}
+
+// anchor 是触发控件在屏幕上的物理矩形：菜单优先贴在它下面，放不下就翻到上面，
+// 横向夹在工作区里。
+UINT Md3RunMenu(HWND owner, const RECT& anchor, std::vector<Md3MenuItem> items, bool dark)
+{
+	if (items.empty() || owner == nullptr || !RegisterMd3MenuClass()) return 0;
+
+	Md3MenuState state;
+	state.owner = owner;
+	state.dark = dark;
+	state.items = std::move(items);
+	state.scale = AuxScale(owner);
+
+	// 量一遍最宽的标签。MeasureString 会带一点内边距，后面再留 10 像素余量。
+	int widest = 0;
+	{
+		Bitmap probe(1, 1, PixelFormat32bppARGB);
+		Graphics measure(&probe);
+		Font* font = ResolveTextFont(kMd3FontSize, FontStyleRegular);
+		for (const Md3MenuItem& item : state.items) {
+			if (item.separator) continue;
+			RectF bounds;
+			if (measure.MeasureString(item.label.c_str(), -1, font, PointF(0, 0), &bounds) == Ok)
+				widest = (std::max)(widest, static_cast<int>(bounds.Width + 0.5f));
+		}
+	}
+	state.widthLogical = (std::max)(190, widest + kMd3MenuPad * 2 + kMd3TextInset * 2 + 10);
+	state.heightLogical = kMd3MenuPad * 2;
+	for (const Md3MenuItem& item : state.items) {
+		state.tops.push_back(state.heightLogical);
+		state.heightLogical += item.separator ? kMd3SeparatorHeight : kMd3ItemHeight;
+	}
+
+	state.widthPhysical = (std::max)(1, static_cast<int>(std::lround(state.widthLogical * state.scale)));
+	state.heightPhysical = (std::max)(1, static_cast<int>(std::lround(state.heightLogical * state.scale)));
+
+	const RECT work = AuxWorkArea(owner);
+	int x = anchor.left;
+	int y = anchor.bottom + 6;
+	if (y + state.heightPhysical > work.bottom - 8) y = anchor.top - state.heightPhysical - 6;
+	if (y < work.top + 8) y = work.top + 8;
+	if (x + state.widthPhysical > work.right - 8) x = work.right - 8 - state.widthPhysical;
+	if (x < work.left + 8) x = work.left + 8;
+	state.origin.x = x;
+	state.origin.y = y;
+
+	BITMAPINFO info{};
+	info.bmiHeader.biSize = sizeof(info.bmiHeader);
+	info.bmiHeader.biWidth = state.widthPhysical;
+	info.bmiHeader.biHeight = -state.heightPhysical;   // 自上而下，和 GDI+ 的行序一致
+	info.bmiHeader.biPlanes = 1;
+	info.bmiHeader.biBitCount = 32;
+	info.bmiHeader.biCompression = BI_RGB;
+	void* bits = nullptr;
+	state.bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+	if (state.bitmap == nullptr || bits == nullptr) {
+		if (state.bitmap) DeleteObject(state.bitmap);
+		return 0;
+	}
+	state.bits = bits;
+	state.memoryDc = CreateCompatibleDC(nullptr);
+	if (state.memoryDc == nullptr) {
+		DeleteObject(state.bitmap);
+		return 0;
+	}
+	HGDIOBJ previous = SelectObject(state.memoryDc, state.bitmap);
+
+	state.window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kMd3MenuClass, L"",
+		WS_POPUP, state.origin.x, state.origin.y, state.widthPhysical, state.heightPhysical,
+		owner, nullptr, GetModuleHandleW(nullptr), &state);
+	if (state.window == nullptr) {
+		SelectObject(state.memoryDc, previous);
+		DeleteDC(state.memoryDc);
+		DeleteObject(state.bitmap);
+		return 0;
+	}
+
+	Md3Render(state);
+	ShowWindow(state.window, SW_SHOWNA);
+	SetFocus(state.window);
+	SetCapture(state.window);
+	// 激活这一步会把窗口挪到一个我们没给过的坐标（观察到的 SetWindowPos 带
+	// SWP_NOSIZE|SWP_NOZORDER），菜单就跑到卡片左上角去了。所以在这一步之后
+	// 再摆一次，位置以 state.origin 为准。
+	SetWindowPos(state.window, HWND_TOPMOST, state.origin.x, state.origin.y,
+		state.widthPhysical, state.heightPhysical, SWP_NOACTIVATE);
+
+	// 用 TrackPopupMenu 的时候，这条循环是系统替我们跑的；现在得自己转。
+	MSG message{};
+	while (!state.finished) {
+		const BOOL got = GetMessageW(&message, nullptr, 0, 0);
+		if (got <= 0) {
+			if (got == 0) PostQuitMessage(0);
+			break;
+		}
+		TranslateMessage(&message);
+		DispatchMessageW(&message);
+	}
+
+	if (IsWindow(state.window)) DestroyWindow(state.window);
+	SelectObject(state.memoryDc, previous);
+	DeleteDC(state.memoryDc);
+	DeleteObject(state.bitmap);
+	return state.result;
+}
+
+}  // namespace
+
 void MainWindow::ShowPowerMenu()
 {
-	HMENU menu = CreatePopupMenu();
-	AppendMenuW(menu, MF_STRING, CMD_POWER_SHUTDOWN, L"\u5173\u95ed\u8ba1\u7b97\u673a");
-	AppendMenuW(menu, MF_STRING, CMD_POWER_RESTART, L"\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a");
-	AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-	AppendMenuW(menu, MF_STRING, CMD_POWER_EXIT, L"\u9000\u51fa Dzjs Trainer");
-	POINT point{};
-	GetCursorPos(&point);
-	TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, _hWnd, nullptr);
-	DestroyMenu(menu);
+	// 和「电子教室操作」用同一套自绘菜单，免得一个圆角卡片风格的界面里跳出
+	// 一个系统方角菜单。
+	std::vector<Md3MenuItem> items;
+	auto addItem = [&items](const wchar_t* label, UINT command, bool danger = false) {
+		Md3MenuItem item;
+		item.label = label;
+		item.command = command;
+		item.danger = danger;
+		items.push_back(std::move(item));
+	};
+	addItem(L"\u5173\u95ed\u8ba1\u7b97\u673a", CMD_POWER_SHUTDOWN);
+	addItem(L"\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a", CMD_POWER_RESTART);
+	{
+		Md3MenuItem separator;
+		separator.separator = true;
+		items.push_back(std::move(separator));
+	}
+	addItem(L"\u9000\u51fa Dzjs Trainer", CMD_POWER_EXIT, true);
+
+	POINT cursor{};
+	GetCursorPos(&cursor);
+	const RECT anchor{ cursor.x, cursor.y - 8, cursor.x, cursor.y - 8 };
+	SetForegroundWindow(_hWnd);
+	const UINT command = Md3RunMenu(_hWnd, anchor, std::move(items), darkMode);
+	if (command != 0) PostMessageW(_hWnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
+}
+
+void MainWindow::ShowEduMenu()
+{
+	const bool hasJiYu = studentRunning;
+	const bool jiYuLocated = hasJiYu || (currentWorker && currentWorker->IsStudentMainLocated());
+
+	// 结束和启动共用一个菜单。分成两个入口的话，用户得先自己判断「它现在算不算
+	// 在跑」才知道该点哪个，而这件事本来就是程序更清楚。
+	std::vector<Md3MenuItem> items;
+	auto addItem = [&items](std::wstring label, UINT command, bool danger = false) {
+		Md3MenuItem item;
+		item.label = std::move(label);
+		item.command = command;
+		item.danger = danger;
+		items.push_back(std::move(item));
+	};
+	auto addSeparator = [&items]() {
+		if (items.empty() || items.back().separator) return;
+		Md3MenuItem item;
+		item.separator = true;
+		items.push_back(std::move(item));
+	};
+
+	int running = 0;
+	if (hasJiYu) {
+		addItem(L"\u6781\u57df\u7535\u5b50\u6559\u5ba4", CMD_END_JIYU);
+		++running;
+	}
+	for (int i = 0; i < kEduProductCount; ++i) {
+		const int count = currentWorker ? currentWorker->GetEduHostCountOf(kEduProducts[i].name) : 0;
+		// 注入记录只说明「已经接管了几个」，不说明「跑没跑」。红蜘蛛的学生端
+		// 被守护进程拉起来之后，要等下一轮扫描才进记录，这十几秒里用户看得见
+		// 它在跑，菜单却只给「启动」——所以按进程本身再判一次。
+		const bool productRunning = count > 0 ||
+			(currentWorker && currentWorker->IsEduProductRunning(kEduProducts[i].name));
+		if (!productRunning) continue;
+		std::wstring label = kEduProducts[i].name;
+		if (count > 1) label += L" \u00d7" + std::to_wstring(count);
+		addItem(label, CMD_END_EDU_BASE + i);
+		++running;
+	}
+	// 只有一款在跑时，下面的「全部结束」和上面那条是同一件事，没必要占一行。
+	// 全部结束是不可逆的那一条，文字用强调色分出来。
+	if (running > 1) {
+		addSeparator();
+		addItem(L"\u5168\u90e8\u7ed3\u675f", CMD_END_ALL, true);
+	}
+
+	// 启动这一半只列「装过、现在没跑」的。极域那一条沿用原来那句话的意思：
+	// 没在跑的时候点它就是把它拉起来。
+	std::vector<int> startable;
+	if (!hasJiYu && jiYuLocated) startable.push_back(CMD_START_JIYU);
+	if (currentWorker) {
+		for (int i = 0; i < kEduProductCount; ++i)
+			if (currentWorker->CanStartEduHost(kEduProducts[i].name))
+				startable.push_back(CMD_START_EDU_BASE + i);
+	}
+	if (!startable.empty()) {
+		addSeparator();
+		for (int command : startable) {
+			if (command == CMD_START_JIYU)
+				addItem(L"\u91cd\u542f\u7535\u5b50\u6559\u5ba4", command);
+			else
+				addItem(L"\u542f\u52a8" + std::wstring(kEduProducts[command - CMD_START_EDU_BASE].name), command);
+		}
+	}
+
+	if (items.empty()) {
+		ShowFastTip(L"\u6ca1\u6709\u68c0\u6d4b\u5230\u7535\u5b50\u6559\u5ba4");
+		return;
+	}
+
+	// 以快捷卡为锚点。actionRects 存的是逻辑坐标（整帧绘制前 ScaleTransform
+	// 过），ClientToScreen 要的是物理坐标，125% / 150% 下不换算会弹到左上角去。
+	RECT anchor{};
+	if (actionRects[2].right > actionRects[2].left) {
+		POINT topLeft{ ToPhysical(actionRects[2].left), ToPhysical(actionRects[2].top) };
+		POINT bottomRight{ ToPhysical(actionRects[2].right), ToPhysical(actionRects[2].bottom) };
+		ClientToScreen(_hWnd, &topLeft);
+		ClientToScreen(_hWnd, &bottomRight);
+		anchor = RECT{ topLeft.x, topLeft.y, bottomRight.x, bottomRight.y };
+	}
+	else {
+		POINT cursor{};
+		GetCursorPos(&cursor);
+		anchor = RECT{ cursor.x, cursor.y, cursor.x, cursor.y };
+	}
+
+	SetForegroundWindow(_hWnd);
+	const UINT command = Md3RunMenu(_hWnd, anchor, std::move(items), darkMode);
+	// 菜单自己的消息循环里已经把点击处理完了，命令回到主窗口的消息队列再走，
+	// 免得在菜单销毁的半路上重入界面。
+	if (command != 0) PostMessageW(_hWnd, WM_COMMAND, MAKEWPARAM(command, 0), 0);
 }
 
 void MainWindow::ShowHelp()
 {
 	MessageBoxW(_hWnd,
-		L"Dzjs Trainer \u4f1a\u81ea\u52a8\u68c0\u6d4b\u5e76\u63a7\u5236\u6781\u57df\u8fdb\u7a0b\u3002\n\n"
+		L"Dzjs Trainer \u4f1a\u81ea\u52a8\u68c0\u6d4b\u5e76\u63a7\u5236\u6781\u57df\u53ca\u5176\u4ed6\u7535\u5b50\u6559\u5ba4\u7684\u8fdb\u7a0b\u3002\n\n"
 		L"\u53ef\u5728\u201c\u9632\u62a4\u7b56\u7565\u201d\u4e2d\u8c03\u6574\u8fdc\u7a0b\u64cd\u4f5c\u6743\u9650\uff0c\u5728\u201c\u8fd0\u884c\u65e5\u5fd7\u201d\u4e2d\u67e5\u770b\u5b9e\u65f6\u72b6\u6001\u3002",
 		L"Dzjs Trainer \u5e2e\u52a9", MB_OK | MB_ICONINFORMATION);
 }
@@ -9154,6 +11221,9 @@ void MainWindow::ApplyTemporaryVideoProtection()
 	const std::wstring mode = L"hk:setvideomode:" + temporaryVideoMode;
 	currentWorker->SendMessageToVirus(mode.c_str());
 	currentWorker->SendMessageToVirus(temporaryVideoProtection ? L"hk:setvideo:1" : L"hk:setvideo:0");
+	// 上面几条只发给极域。其他教室的宿主不认这套命令，让它们重读一次 ini，
+	// 否则界面切了「信息流保护」，教师端那边看到的还是旧画面。
+	currentWorker->SyncCustomHosts();
 }
 
 bool MainWindow::ChooseTemporaryVideoMedia(bool image)
@@ -9196,7 +11266,20 @@ void MainWindow::OnUpdateStudentMainInfo(bool running, LPCWSTR fullPath, DWORD p
 		std::lock_guard<std::mutex> guard(stateMutex);
 		studentRunning = running;
 		studentPid = running ? pid : 0;
-		studentPath = running && fullPath ? fullPath : L"未检测到";
+		// 路径是「定位结果」，不是「运行结果」。极域没跑但已经找到 exe 时，标题
+		// 会写「已在此计算机上找到极域电子教室」，这张卡却写「未检测到」——
+		// 同一屏两句话互相打脸。
+		studentPath = (fullPath && fullPath[0]) ? fullPath : L"未检测到";
+	}
+	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
+}
+
+void MainWindow::OnUpdateEduHosts(int count, LPCWSTR summary)
+{
+	{
+		std::lock_guard<std::mutex> guard(stateMutex);
+		eduHostCount = count;
+		eduHostSummary = summary ? summary : L"";
 	}
 	PostMessageW(_hWnd, WM_NATIVE_REFRESH, 0, 0);
 }
@@ -9221,6 +11304,19 @@ void MainWindow::OnSimpleMessageCallback(LPCWSTR text) { ShowFastTip(text); }
 void MainWindow::OnAllowGbTop() { setAllowGbTop = true; SaveSettings(); }
 void MainWindow::OnShowHelp() { ShowHelp(); }
 
+void MainWindow::OnShutdownBlocked(LPCWSTR api)
+{
+	(void)api;   // 具体拦在哪个函数上已经进日志了，界面上不区分子类名
+	// 这条来自注入的教室进程（Hooks 里 blockShutdown 那一组）。窗口缩在托盘时
+	// 先露出来 —— 否则提示画在一个看不见的窗口上，等于没提示。已经在屏幕上
+	// 就不抢焦点：用户可能正开着别的窗口，被弹一下已经很打扰了。
+	if (!IsWindowVisible(_hWnd)) {
+		ShowWindow(_hWnd, SW_SHOW);
+		SetForegroundWindow(_hWnd);
+	}
+	ShowFastTip(L"\u5df2\u62e6\u622a\u7535\u5b50\u6559\u5ba4\u7684\u5173\u673a / \u91cd\u542f\u8bf7\u6c42\uff1b\u8981\u5173\u673a\u8bf7\u7528 \u7535\u6e90\u63a7\u5236");
+}
+
 void MainWindow::LoadSettings()
 {
 	auto settings = JTAppGetSettingsDirect();
@@ -9228,6 +11324,8 @@ void MainWindow::LoadSettings()
 	setTopMost = settings->GetSettingBool(L"TopMost", true);
 	setAllowAllRunOp = settings->GetSettingBool(L"AllowAllRunOp", true);
 	setAllowMonitor = settings->GetSettingBool(L"AllowMonitor", true);
+	// 自动接管其他电子教室。默认开，和工作线程里的默认值保持一致。
+	eduCompatAutoInject = settings->GetSettingBool(L"EduCompatAutoInject", true);
 	// 默认值必须和注入端 VInitSettings 的默认值一致，否则界面显示"已拦截"、
 	// 钩子那边其实是放行，两边对不上。2026-11-14 起全部默认只记录。
 	setAllowControl = settings->GetSettingBool(L"AllowControl", true);
@@ -9331,6 +11429,7 @@ void MainWindow::OnFirstShow()
 			topMostUiAccessBand = bandApplied;
 		}
 	}
+	SyncTopmostKeepTimer();
 	if (currentWorker) {
 		currentWorker->Init();
 		currentWorker->Start();
@@ -9366,15 +11465,15 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		InvalidateRect(_hWnd, nullptr, FALSE);
 		return;
 	}
-	if (command == 0x7C01) {   // 内置控制台的"发送"按钮
-		SendTeacherConsoleCommand();
-		return;
-	}
 	if (command == IDC_NET_TEACHER) {
 		LaunchEmbeddedTeacherGui();
 		return;
 	}
-	if ((command >= IDC_TEACHER_REFRESH && command <= IDC_TEACHER_REBOOT) || command == IDC_TEACHER_VIEW || command == IDC_TEACHER_CHAT_SEND) {
+	// 区块里混着聊天输入框的 IDC_TEACHER_CHAT_INPUT：不过滤通知码的话，
+	// 每敲一个字都会当成一次按钮命令，服务没开时结果栏会被「请先启动教师服务」刷满。
+	if (HIWORD(wParam) == BN_CLICKED &&
+		((command >= IDC_TEACHER_REFRESH && command <= IDC_TEACHER_REBOOT) ||
+			command == IDC_TEACHER_VIEW || command == IDC_TEACHER_CHAT_SEND)) {
 		HandleTeacherCommand(command);
 		return;
 	}
@@ -9401,14 +11500,63 @@ void MainWindow::OnWmCommand(WPARAM wParam)
 		DestroyWindow(_hWnd);
 		break; }
 	case CMD_POWER_SHUTDOWN:
-		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u5173\u95ed\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES)
-			ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, 0);
+		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u5173\u95ed\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES) {
+			// 拦的是"别人发起的关机"，自己点菜单当然要放行。
+			allowShutdown = true;
+			if (!ExitWindowsEx(EWX_SHUTDOWN | EWX_FORCE, 0)) {
+				allowShutdown = false;
+				ShowFastTip(L"\u5173\u673a\u8bf7\u6c42\u6ca1\u53d1\u51fa\u53bb\uff0c\u53ef\u80fd\u6ca1\u6709\u6743\u9650");
+			}
+		}
 		break;
 	case CMD_POWER_RESTART:
-		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES)
-			ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0);
+		if (MessageBoxW(_hWnd, L"\u786e\u5b9a\u91cd\u65b0\u542f\u52a8\u8ba1\u7b97\u673a\uff1f", L"Dzjs Trainer", MB_YESNO | MB_ICONWARNING) == IDYES) {
+			allowShutdown = true;
+			if (!ExitWindowsEx(EWX_REBOOT | EWX_FORCE, 0)) {
+				allowShutdown = false;
+				ShowFastTip(L"\u91cd\u542f\u8bf7\u6c42\u6ca1\u53d1\u51fa\u53bb\uff0c\u53ef\u80fd\u6ca1\u6709\u6743\u9650");
+			}
+		}
 		break;
+	case CMD_END_JIYU:
+		if (currentWorker) {
+			const bool killed = currentWorker->Kill();
+			ShowFastTip(killed ? L"\u5df2\u7ed3\u675f\u6781\u57df\u7535\u5b50\u6559\u5ba4"
+				: L"\u7ed3\u675f\u6781\u57df\u7535\u5b50\u6559\u5ba4\u5931\u8d25\uff0c\u8be6\u89c1\u65e5\u5fd7");
+		}
+		break;
+	case CMD_START_JIYU:
+		if (currentWorker) {
+			const bool started = currentWorker->Rerun();
+			ShowFastTip(started ? L"\u5df2\u542f\u52a8\u7535\u5b50\u6559\u5ba4"
+				: L"\u65e0\u6cd5\u542f\u52a8\u7535\u5b50\u6559\u5ba4\uff0c\u8be6\u89c1\u65e5\u5fd7");
+		}
+		break;
+	case CMD_END_ALL: {
+		if (!currentWorker) break;
+		bool any = false;
+		if (studentRunning && currentWorker->Kill()) any = true;
+		if (currentWorker->KillEduHosts(nullptr) > 0) any = true;
+		ShowFastTip(any ? L"\u5df2\u7ed3\u675f\u7535\u5b50\u6559\u5ba4"
+			: L"\u6ca1\u6709\u53ef\u4ee5\u7ed3\u675f\u7684\u7535\u5b50\u6559\u5ba4");
+		break; }
 	default:
+		if (command >= CMD_END_EDU_BASE && command < CMD_END_EDU_BASE + kEduProductCount) {
+			const wchar_t* product = kEduProducts[command - CMD_END_EDU_BASE].name;
+			const int killed = currentWorker ? currentWorker->KillEduHosts(product) : 0;
+			std::wstring tip = killed > 0 ? L"\u5df2\u7ed3\u675f" : L"\u65e0\u6cd5\u7ed3\u675f";
+			tip += product;
+			ShowFastTip(tip.c_str());
+			break;
+		}
+		if (command >= CMD_START_EDU_BASE && command < CMD_START_EDU_BASE + kEduProductCount) {
+			const wchar_t* product = kEduProducts[command - CMD_START_EDU_BASE].name;
+			const bool started = currentWorker && currentWorker->StartEduHost(product);
+			std::wstring tip = started ? L"\u5df2\u542f\u52a8" : L"\u65e0\u6cd5\u542f\u52a8";
+			tip += product;
+			ShowFastTip(tip.c_str());
+			break;
+		}
 		if (command >= IDC_NET_DETECT_PORT && command <= IDC_NET_SCAN)
 			HandleNetworkCommand(command);
 		break;
@@ -9424,6 +11572,20 @@ void MainWindow::EnsureAnimationTimer()
 
 void MainWindow::OnWmTimer(WPARAM timer)
 {
+	if (timer == TIMER_TOPMOST_KEEP) {
+		if (!setTopMost || topMostUiAccessBand) {
+			KillTimer(_hWnd, TIMER_TOPMOST_KEEP);
+			topmostKeepTimerRunning = false;
+			return;
+		}
+		// 菜单、AV 提示、进程选择器这些都是主窗口的 owned 弹窗，同样在
+		// topmost 带上。这一拍再置顶会把它们压到主窗口下面，跳过。
+		if (GetWindow(_hWnd, GW_ENABLEDPOPUP) != nullptr) return;
+		if (!IsWindowVisible(_hWnd) || IsIconic(_hWnd)) return;
+		SetWindowPos(_hWnd, HWND_TOPMOST, 0, 0, 0, 0,
+			SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+		return;
+	}
 	if (timer == TIMER_SERVICE_POLL) {
 		PollEmbeddedTeacherGui();
 		PollTeacherService();
@@ -9483,6 +11645,13 @@ void MainWindow::OnWmTimer(WPARAM timer)
 
 		// 进程选择器：只有入场淡入，没有持续动画。
 		if (ProcessPickerVisible() && approach(processPicker.appear, 1.0f, 0.06)) needsPaint = true;
+		if (ProtectDialogVisible() && approach(protectDialogAppear, 1.0f, 0.06)) needsPaint = true;
+		if (FeedbackDialogVisible() && approach(feedbackDialogAppear, 1.0f, 0.06)) {
+			needsPaint = true;
+			// 原生 EDIT 不能跟着淡入：底色铺到三成才露头，顺带把位置再校一次
+			// （动画期间窗口可能被拖动或被系统改尺寸）。
+			PositionFeedbackEdits();
+		}
 
 		const bool toastAlive = !toastText.empty() && now <= toastUntil;
 		if (!toastText.empty() && !toastAlive) {
@@ -9550,6 +11719,8 @@ void MainWindow::OnWmDestroy()
 	KillTimer(_hWnd, TIMER_SERVICE_POLL);
 	animationTimerRunning = false;
 	KillTimer(_hWnd, TIMER_TRAY_REPAIR);
+	KillTimer(_hWnd, TIMER_TOPMOST_KEEP);
+	topmostKeepTimerRunning = false;
 	UnregisterHotKey(_hWnd, hotkeyShowHide);
 	UnregisterHotKey(_hWnd, hotkeySwFull);
 	if (trayIconRegistered) Shell_NotifyIconW(NIM_DELETE, &nid);

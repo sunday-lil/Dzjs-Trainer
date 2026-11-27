@@ -1,16 +1,10 @@
 # Dzjs Trainer
 
-[![ci](https://github.com/sunday-lil/Dzjs-Trainer/actions/workflows/ci.yml/badge.svg)](https://github.com/sunday-lil/Dzjs-Trainer/actions/workflows/ci.yml)
+当前版本：`v1.0.6`
 
+Dzjs Trainer 是 JiYu Trainer 的翻新版本，面向经授权的教学机房、设备维护与兼容性研究场景。
 
-当前版本：`v1.0.5.2`
-
-> 本仓库是**社区修复版**（fork）。与上游的差异、构建方式与已知限制见 [docs/EDITION.md](docs/EDITION.md)。
-
-
-Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项目，面向经授权的教学机房、设备维护与兼容性研究场景。
-
-本项目由云散皆星河维护，感谢 JiYu Trainer 原作者快乐的梦鱼。项目已获得原作者 @快乐的梦鱼 的口头许可，在保留原项目贡献说明的基础上继续演进。
+本项目由云散皆星河维护，感谢 JiYu Trainer 原作者快乐的梦鱼，已获得他的口头许可继续演进，原项目的贡献说明都保留着。
 
 > 请仅在你拥有、管理或获得明确授权的设备与网络中使用本项目。不要将其用于绕过组织的安全管理、侵犯他人隐私或影响他人设备正常使用。
 
@@ -18,133 +12,43 @@ Dzjs Trainer 是基于 JiYu Trainer 翻新和持续维护的 Windows 桌面项�
 
 相较于早期 JiYu Trainer，Dzjs Trainer 主要做了这些翻新：
 
-- 重新编写并维护 x64 系统驱动，支持独立签名和发布流程。
-- 替换旧驱动里容易把系统搞崩的写法。比如 SSDT Hook 容易踩 PatchGuard，换成了内核回调。
-- 重构防护与驱动加载流程，增加驱动签名校验、发布者约束和运行状态诊断。
-- 翻新主界面，补充退出确认、信息流保护、预览与设备诊断等交互能力。
-- 增加对机房管理助手的适配支持。
-- 保留并完善极域相关的兼容与反控能力。
+- 驱动重写了，x64，能独立签名发版。
+- 旧驱动里有些写法容易把系统搞崩，换掉了。比如 SSDT Hook 会踩 PatchGuard，改成内核回调。
+- 防护和驱动加载流程也重做过，加了签名校验和发布者约束，驱动起没起来能直接看到。
+- 界面翻新，补了退出确认、信息流保护、预览和设备诊断。
+- 机房管理助手也适配了。
+- 极域那套兼容和反控能力都留着，还在继续完善。
 
-当前重点维护极域电子教室与机房管理助手环境。Gakataka、红蜘蛛等电子教室产品属于后续适配计划，不代表当前版本已经完整支持。
+现在主要维护极域电子教室和机房管理助手这两套环境。伽卡他卡、红蜘蛛、联想传奇也接进来了，但只是初步适配，见下面的支持范围。
 
-## 特性
+## 功能
 
-- Windows 桌面管理界面与托盘运行模式。
-- 教学终端兼容性检测、状态诊断与运行日志。
-- 可配置的设备防护策略和信息流保护开关。
-- x64 内核驱动与驱动签名验证链路。
-- 图片与视频预览、选择框与相关界面能力。
-- 可将兼容层注入指定进程，32 位与 64 位目标均可。
-- 可选的画面替换，覆盖 BitBlt、StretchBlt、PrintWindow、GetDIBits 等抓屏路径。
-- 极域电子教室、机房管理助手的兼容适配基础。
+- 桌面管理界面，可以常驻托盘。
+- 能检测教学终端兼容性，有状态诊断和运行日志。
+- 设备防护策略、信息流保护都能单独开关。
+- x64 内核驱动，签名验证链路完整。
+- 图片和视频直接预览，还有选择框一类的界面能力。
+- 能把兼容层注入指定进程，32 位 64 位都支持。
+- 画面替换可选，覆盖 BitBlt、StretchBlt、PrintWindow、GetDIBits 这些抓屏路径。
+- 极域电子教室和机房管理助手都做了适配基础。
 
-## 文档
+## 开始使用
 
-| 文档 | 内容 |
-| --- | --- |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 进程/驱动/Hook/网络/更新的整体结构与关键机制 |
-| [docs/BUILD.md](docs/BUILD.md) | 从零复现构建的顺序、期望产物、常见报错 |
-| [docs/RELEASE-PIPELINE.md](docs/RELEASE-PIPELINE.md) | 签名、打包、更新服务与站点同步的现状 |
-| [docs/REPO-LAYOUT.md](docs/REPO-LAYOUT.md) | 目录职责与不可移动的构建绑定文件 |
-| [docs/DRIVER-SIGNATURE-POLICY.md](docs/DRIVER-SIGNATURE-POLICY.md) | 驱动发布者白名单与内核 guard 规则 |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | 提交流程、代码风格、禁提交清单 |
-| [docs/EDITION.md](docs/EDITION.md) | 本社区修复版与上游的差异、构建与限制 |
-| [docs/LAB-DEPLOY.md](docs/LAB-DEPLOY.md) | 机房部署：无驱动模式、测试签名、还原卡注意事项 |
+发布包就一个 `DzjsTrainer.exe`，双击就跑，不用装。第一次启动会申请管理员权限，驱动和兼容层由程序自己放出来，不用你提前准备什么。
 
-## 架构
+日志和配置放在 exe 旁边，同名的 `.ini` 和 `.log`。目录不可写时退到 `%LOCALAPPDATA%\DzjsTrainer\`。
 
-| 目录 | 说明 |
-| --- | --- |
-| `DzjsTrainer` | 主程序、驱动加载和资源嵌入逻辑 |
-| `DzjsTrainerUI` | 原生 Windows UI 与交互逻辑 |
-| `DzjsTrainerDriver` | x64 WDM 驱动源码（`legacy-x86/` 为 2019 年存档，不参与编译） |
-| `DzjsTrainerHooks` | 兼容层与 Hook 模块源码 |
-| `DzjsTrainerUpdater` | 更新组件源码 |
-| `JiYuAvKernel` / `JiYuAvCtl` | 辅助驱动与控制工具 |
-| `tools` | 驱动构建、签名、令牌与验证脚本 |
-| `docs` | 架构、构建、发布与目录说明 |
-| `assets` / `include` / `resources` | 品牌资源、跨工程共享头、构建期固定输入 |
-| `scripts` | 开发者本地脚本 |
-| `third_party` | curl、MemoryModule、XZip 等上游源码（详见其 README） |
-| `DzjsTrainer.sln` | 主解决方案 |
+## 运行要求
 
-目录职责、哪些文件必须留在根目录、以及各第三方组件的编译状态，见 [docs/REPO-LAYOUT.md](docs/REPO-LAYOUT.md)。
+Windows 10 以上。系统低于 Windows 10 2004（19041）时驱动加载不了——驱动里用了 `ExAllocatePool2`，更早的内核没这个导入，开测试模式也没用。程序本身不受影响。
 
-主程序使用 x86 配置构建；驱动使用 x64 配置构建。解决方案已配置二者的依赖关系。
+驱动不是必须的。没开测试模式、驱动没加载上，窗口化、进程注入、替换画面和涂黑都照常，缺的只有内核级杀进程、进程自保护和 AV 扫描。日志里会写驱动为什么没起来。
 
-## 环境要求
+发布包里的驱动能直接加载，不用开测试模式，Secure Boot 也不用关。
 
-- Windows 10 或更高版本。
-- Visual Studio 2022 或更高版本，包含 C++ 桌面开发和 MSBuild。
-- Windows 10/11 SDK。
-- 构建 `DzjsTrainerDriver` 时需要安装与系统匹配的 WDK。
+自己编的包不一样。没有签名证书只能自签，这种驱动在 Windows 10 1607 之后必须开测试模式；Secure Boot 开着还得先进 BIOS 关掉，否则 `StartService` 返回 577，日志里是 `Load driver error in StartService : 577`。
 
-## 构建
-
-使用 Visual Studio 打开 `DzjsTrainer.sln`，选择 `Release | x86` 后生成整个解决方案。
-
-也可以在开发者命令行中执行：
-
-```powershell
-MSBuild.exe DzjsTrainer.sln /t:Build /p:Configuration=Release /p:Platform=x86 /m
-```
-
-驱动可单独构建：
-
-```powershell
-MSBuild.exe DzjsTrainerDriver\DzjsTrainerDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64 /m
-```
-
-构建产物会写入被 Git 忽略的 `Release` 目录，不应提交到源码仓库。
-
-> **干净 clone 不能一次编完。** 主程序把驱动、两份 Hook DLL、注入助手与更新器作为 BIN 资源内嵌，这些文件必须先由各自的工程生成；此外 32 位注入实现（`DllInjector`）不在仓库内。完整的真实顺序、期望产物和常见报错见 [docs/BUILD.md](docs/BUILD.md)。
-
-### 更新通道公钥
-
-`DzjsTrainerUpdater` 需要一把内嵌的 RSA 公钥来验证服务器返回的时效票据。仓库里不含真实公钥，只有 `DzjsTrainerUpdater/UpdaterTicketKey.h.example` —— 示例公钥，对应私钥 `update-server/ticket-sign.pem.example` 是公开的。
-
-`UpdaterTicket.h` 通过 `__has_include` 回退到 `.example`，所以克隆下来直接就能编译。这样编出来的程序连不上正式更新服务器，会明确提示「此版本内置的是开源示例公钥」—— 这是刻意的失败方向，不是缺陷。
-
-要构建能接收正式更新的发行版，先把自己的公钥生成进去：
-
-```powershell
-python tools\make-ticket-key.py
-```
-
-脚本读取 `update-server/ticket-sign.pub.der`，生成被 Git 忽略的 `DzjsTrainerUpdater/UpdaterTicketKey.h`。加 `--check` 可确认现有头文件没有和 DER 脱节。
-
-这份 DER 同样不进版本库 —— 否则任何人都能一键编出一个连得上正式服务器的客户端，占位符就白做了。它从私钥导出：
-
-```powershell
-openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-server\ticket-sign.pub.der
-```
-
-## 驱动签名与发布
-
-仓库不包含发布者的代码签名证书、私有解锁密钥或实际解锁令牌。`DzjsTrainerDriver.unlock.enc.sample` 是公开构建所需的占位资源。
-
-> **注意：用上面的 MSBuild 命令构建出来的 exe，无法卸载自己加载的驱动。**
->
-> `DzjsTrainer.vcxproj` 把 `IDR_DRIVER_UNLOCK_TOKEN` 固定绑定到
-> `$(SolutionDir)DzjsTrainerDriver.unlock.enc.sample`，而该占位令牌与本次构建产出的
-> `.sys` 并不匹配。驱动会拒绝卸载，日志中出现：
->
-> ```
-> [E] Embedded unload token is missing, invalid, or cannot be decrypted
-> [E] Driver unload authorization failed; service stop was not attempted
-> ```
->
-> 这是预期行为，不是缺陷。要获得可卸载的构建，必须走下面的签名流程，让
-> `tools\Complete-DriverSigning.ps1` 针对当次驱动重新生成令牌并回嵌主程序。
-> 开发调试阶段如需卸载，可手工 `sc stop <驱动服务名>` 后重启。
-
-发布维护者需要自行完成以下工作：
-
-1. 使用自己的证书签名最终驱动文件。
-2. 运行 `tools\Complete-DriverSigning.ps1` 更新驱动包，并重新嵌入主程序资源。
-3. 使用 `tools\Build-DzjsTrainerRelease.ps1` 验证签名者、资源哈希与发布产物。
-
-如需启用实际解锁令牌流程，请在本地使用 `tools\New-DriverUnlockKeys.ps1` 和 `tools\New-DriverUnlockToken.ps1` 生成自己的密钥与令牌；私有材料不得提交到仓库。
+教师端嵌入只接受 FLTK 窗口。公开的 `Third-party-JiYu-Teacher-Endpoint` 是 Python 版，只有控制台，等不到窗口就自动改成独立窗口运行，进程不会被杀掉。
 
 ## 支持范围
 
@@ -152,32 +56,31 @@ openssl pkey -in update-server\ticket-sign.pem -pubout -outform DER -out update-
 | --- | --- |
 | 极域电子教室 | 持续维护 |
 | 机房管理助手 | 已提供适配基础 |
-| Gakataka | 计划中 |
-| 红蜘蛛 | 计划中 |
+| Gakataka（伽卡他卡） | 初步适配 |
+| 红蜘蛛 | 初步适配 |
+| 联想传奇 | 初步适配 |
 
-不同系统版本、终端版本和安全策略的行为可能不同。请先在隔离测试环境验证，再进行经授权的部署。
+「初步适配」是指能自动认出学生端进程，按和极域一样的口径装拦截：窗口、进程、输入、假桌面、截屏路径都覆盖。没有逐个版本验证过，实际能拦住多少要看它们各自走哪套手段。
 
-## 贡献
+几套同时装着、同时跑也没问题。每套的学生端各自注入一份拦截，设置改一次全部同步；不用挑一套、关一套。概览页会写清楚现在手里有几个宿主，进程注入页的列表里也会标出每个是哪个产品。
 
-欢迎提交 Issue、修复建议和 Pull Request。完整约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，提交前请确保：
+不想让它自动接管，在「进程注入」页顶部把「自动接管其他电子教室」关掉即可，已经接管的会继续生效到退出。
 
-- 不提交 `Release`、`obj`、`bin`、日志、PDB 或其他构建产物。
-- 不提交证书、私钥、令牌、设备标识或包含敏感环境信息的日志。
-- 为功能修改提供可复现的测试步骤。
-- 保持现有 C++ 与 PowerShell 代码风格，避免无关格式化。
-- 本地先跑一遍仓库自检：
+不同系统版本、终端版本和安全策略下表现可能不一样。先在隔离环境验证过再部署，并确认你有相应授权。
 
-  ```powershell
-  python tools\verify_repo.py --strict
-  ```
+## 参与开发
 
-安全问题请不要在公开 Issue 中披露可复现细节，应先联系维护者。
+构建、签名、更新通道怎么配，都在 [开发者说明](DEVELOPMENT.md)。程序跑不起来也可以先翻那份的调试一节，日志开关和验证工具都写在那儿。这份 README 只讲怎么用。
+
+Issue 和 PR 都欢迎。别把构建产物、证书、私钥、令牌或者带着本机环境信息的日志提上来；改功能的写清楚怎么复现。
+
+安全问题不要发在公开 Issue 里，直接找维护者。
 
 ## 致谢
 
 - JiYu Trainer 原作者：快乐的梦鱼。
 - 当前维护与翻新：云散皆星河。
-- 第三方组件包括 curl、MinHook、MemoryModule、XZip/XUnZip、dnlib 等；各自的版本、许可证与是否参与编译见 [third_party/README.md](third_party/README.md)。
+- 第三方组件包括 curl、MinHook、MemoryModule、XZip/XUnZip、dnlib 等；请分别遵循其许可证要求。
 
 ## 许可证
 
