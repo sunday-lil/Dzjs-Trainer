@@ -8605,11 +8605,19 @@ void MainWindow::StopAvProcessScan()
 {
 	if (avScanCancelEvent) SetEvent(avScanCancelEvent);
 	if (avScanThread) {
-		WaitForSingleObject(avScanThread, INFINITE);
-		CloseHandle(avScanThread);
-		avScanThread = nullptr;
+		// 取消只是置事件，靠驱动 IOCTL 协作返回；无限等待会让退出流程
+		// 永久卡在 WM_DESTROY。超时就把它留在后台：线程还在跑的时候
+		// 关句柄和取消事件，等于把同一批句柄交给后续调用复用。
+		const DWORD waitResult = WaitForSingleObject(avScanThread, 5000);
+		if (waitResult == WAIT_OBJECT_0) {
+			CloseHandle(avScanThread);
+			avScanThread = nullptr;
+		}
+		else if (currentLogger) {
+			currentLogger->LogWarn(L"AV scan thread did not stop within 5s; leaving it detached");
+		}
 	}
-	if (avScanCancelEvent) {
+	if (avScanThread == nullptr && avScanCancelEvent) {
 		CloseHandle(avScanCancelEvent);
 		avScanCancelEvent = nullptr;
 	}

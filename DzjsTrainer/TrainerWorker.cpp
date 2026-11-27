@@ -652,7 +652,10 @@ bool TrainerWorkerInternal::ReadTopDomanPassword(BOOL forceKnock)
 		if (StrEqual(Data, L"Passwd[123456]")) goto READ_EX; //6.0以后读取不了了，都显示Passwd[123456]，用新的方法读取
 		else {
 			_TopDomainPassword = Data;
-			_TopDomainPassword = _TopDomainPassword.substr(6, _TopDomainPassword.size() - 6);
+			// size() <= 6 时 size()-6 是无符号下溢，substr 抛 out_of_range，
+			// 异常穿过窗口过程就是崩进程。
+			if (_TopDomainPassword.size() > 6)
+				_TopDomainPassword = _TopDomainPassword.substr(6);
 			return true;
 		}
 
@@ -836,7 +839,8 @@ void TrainerWorkerInternal::ClearFilterdPid()
 {
 	if (current_system_process)
 	{
-		for (auto it = incorrectStudentMainPids.begin(); it != incorrectStudentMainPids.end(); it++) {
+		// erase 已返回下一个元素；循环头再自增会跳过元素，删到末尾还会越过 end()。
+		for (auto it = incorrectStudentMainPids.begin(); it != incorrectStudentMainPids.end(); ) {
 			auto pid = (*it).pid;
 			bool founded = false;
 			bool done = false;
@@ -848,8 +852,10 @@ void TrainerWorkerInternal::ClearFilterdPid()
 				}
 				done = p->NextEntryOffset == 0;
 			}
-			if (!founded) 
+			if (!founded)
 				it = incorrectStudentMainPids.erase(it);
+			else
+				++it;
 		}
 	}
 }
