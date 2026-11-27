@@ -63,3 +63,9 @@ python tools\verify_repo.py --strict
 
 另外：不要为了绕开本机缺组件而改工程文件（例如把工具集从 v143 自动回退到 v145）。
 需要别的工具集就显式传属性，并在 PR 说明里写清楚。
+
+## 分支基线
+
+上游的最新公开提交不一定在 `main`：发版常常先落在 `feat/*` 再打 tag。开分支一律用
+`scripts/Sync-Upstream.ps1`，它会挑最新的公开 ref 并在提 PR 前提示再对齐一次。
+细节见 [docs/UPSTREAM-SYNC.md](docs/UPSTREAM-SYNC.md)。
