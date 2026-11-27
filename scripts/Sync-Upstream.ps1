@@ -35,13 +35,13 @@ try {
         # 候选：main、feat/*、release/*、以及所有 tag 指向的提交
         $refs = @()
         foreach ($pattern in @("refs/remotes/$Remote/main", "refs/remotes/$Remote/feat/*", "refs/remotes/$Remote/release/*", "refs/tags/*")) {
-            $refs += git for-each-ref --sort=-committerdate --format='%(refname:short)|%(committerdate:iso8601)|%(objectname:short)' $pattern
+            $refs += git for-each-ref --sort=-committerdate --format='%(refname:short)|%(committerdate:unix)|%(objectname:short)' $pattern
         }
         $best = $refs |
             Where-Object { $_ -and $_ -notmatch '\^\{\}$' } |
             ForEach-Object {
                 $parts = $_ -split '\|'
-                [pscustomobject]@{ Ref = $parts[0]; Date = [datetime]$parts[1]; Sha = $parts[2] }
+                [pscustomobject]@{ Ref = $parts[0]; Date = [datetimeoffset]::FromUnixTimeSeconds([long]$parts[1]).LocalDateTime; Sha = $parts[2] }
             } |
             Sort-Object Date -Descending |
             Select-Object -First 1
